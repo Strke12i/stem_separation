@@ -1,0 +1,63 @@
+:root {
+  color: #e8e8ed;
+  background: #16161d;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 32rem;
+  margin: 3rem auto;
+  padding: 2rem;
+  border: 1px solid #373744;
+  border-radius: 0.75rem;
+  background: #20202a;
+}
+
+h1 {
+  margin: 0;
+}
+
+.subtitle,
+.detail {
+  color: #aaaab7;
+}
+
+.import {
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid #373744;
+}
+
+h2 {
+  font-size: 1rem;
+}
+
+.error {
+  color: #ff9b9b;
+}
+
+.good {
+  color: #5ed28a;
+}
+
+.bad {
+  color: #ff7575;
+}
+
+button {
+  padding: 0.6rem 0.9rem;
+  color: inherit;
+  background: #3d69e5;
+  border: 0;
+  border-radius: 0.4rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}

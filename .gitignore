@@ -1,0 +1,11 @@
+/target/
+/node_modules/
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/apps/desktop/src-tauri/gen/
+/python/*-worker/.venv/
+/python/*-worker/.mypy_cache/
+/python/*-worker/.pytest_cache/
+/python/*-worker/.ruff_cache/
+__pycache__/
+*.pyc
