@@ -67,6 +67,25 @@ pub struct LibrarySyncReport {
     pub rebuilt: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibrarySort {
+    #[default]
+    Recent,
+    Name,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryQuery {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub sort: LibrarySort,
+}
+
 #[derive(Debug, Error)]
 pub enum LibraryError {
     #[error("The requested imported track is unavailable.")]
@@ -305,6 +324,60 @@ impl LibraryService {
         Ok(entries)
     }
 
+    /// Filters the already-indexed tracks by free text (matched against
+    /// name, key, and tags) and/or a required set of tags. Does not
+    /// reconcile first: search is expected to run on every keystroke, and
+    /// must not stat the filesystem each time. Call `list()` (or open the
+    /// Library tab, which does) to pick up filesystem changes first.
+    pub fn search(&self, query: &LibraryQuery) -> Result<Vec<LibraryEntry>, LibraryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let order = match query.sort {
+            LibrarySort::Recent => {
+                "last_opened_at IS NULL, last_opened_at DESC, imported_at DESC, original_name_folded ASC"
+            }
+            LibrarySort::Name => "original_name_folded ASC",
+        };
+        let mut sql = format!("{ENTRY_COLUMNS} FROM tracks WHERE 1 = 1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        let text = query.text.trim().to_lowercase();
+        if !text.is_empty() {
+            let pattern = format!("%{}%", escape_like(&text));
+            let index = params.len() + 1;
+            sql.push_str(&format!(
+                " AND (original_name_folded LIKE ?{index} ESCAPE '\\' \
+                   OR lower(coalesce(key_label, '')) LIKE ?{index} ESCAPE '\\' \
+                   OR EXISTS (SELECT 1 FROM track_tags \
+                              WHERE track_tags.track_id = tracks.track_id \
+                                AND track_tags.tag LIKE ?{index} ESCAPE '\\'))"
+            ));
+            params.push(Box::new(pattern));
+        }
+        for tag in &query.tags {
+            let normalized = normalize_tag(tag)?;
+            let index = params.len() + 1;
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM track_tags \
+                              WHERE track_tags.track_id = tracks.track_id AND track_tags.tag = ?{index})"
+            ));
+            params.push(Box::new(normalized));
+        }
+        sql.push_str(&format!(" ORDER BY {order}"));
+
+        let mut statement = connection.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> = params.iter().map(AsRef::as_ref).collect();
+        let mut entries = statement
+            .query_map(bound.as_slice(), row_to_entry)?
+            .collect::<Result<Vec<_>, _>>()?;
+        for entry in &mut entries {
+            entry.tags = read_tags_for(&connection, &entry.track_id)?;
+        }
+        Ok(entries)
+    }
+
     fn scan(&self, force: bool) -> Result<LibrarySyncReport, LibraryError> {
         let workspace_root = self.ingest.workspace_root().to_path_buf();
         let mut seen = HashSet::new();
@@ -516,6 +589,19 @@ fn normalize_tag(tag: &str) -> Result<String, LibraryError> {
         return Err(LibraryError::InvalidTag);
     }
     Ok(normalized)
+}
+
+/// Escapes `%`, `_`, and `\` so user-typed search text is matched literally
+/// in a `LIKE ... ESCAPE '\'` pattern rather than as SQL wildcards.
+fn escape_like(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn split_list(value: &str) -> Vec<String> {
@@ -741,6 +827,13 @@ mod tests {
         connection
             .query_row("SELECT count(*) FROM tracks", [], |row| row.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn escapes_wildcards_in_search_text() {
+        assert_eq!(escape_like("100%_mix"), "100\\%\\_mix");
+        assert_eq!(escape_like("plain"), "plain");
+        assert_eq!(escape_like("back\\slash"), "back\\\\slash");
     }
 
     #[test]

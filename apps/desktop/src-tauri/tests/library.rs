@@ -3,7 +3,7 @@ use analyzer_domain::{
     TrackManifest,
 };
 use local_music_analyzer_desktop::ingest::{IngestService, MediaTools};
-use local_music_analyzer_desktop::library::LibraryService;
+use local_music_analyzer_desktop::library::{LibraryQuery, LibraryService, LibrarySort};
 use std::fs;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -197,6 +197,96 @@ fn lists_tags_with_track_counts() {
     let tags = library.tags().unwrap();
     let funk = tags.iter().find(|tag| tag.tag == "funk").unwrap();
     assert_eq!(funk.track_count, 1);
+}
+
+#[test]
+fn searches_by_name_key_and_tag() {
+    let temp = TempDir::new().unwrap();
+    let ingest = make_ingest(&temp);
+    let track_a = seed_track(&ingest, "Funky Town.mp3");
+    let track_b = seed_track(&ingest, "Ballad.mp3");
+    let track_c = seed_track(&ingest, "Another Song.mp3");
+
+    let (path_b, mut manifest_b) = read_manifest(&ingest, &track_b);
+    manifest_b.analysis.insert(
+        "harmony".to_owned(),
+        serde_json::json!({"key": {"label": "F# minor"}, "chords": []}),
+    );
+    fs::write(&path_b, serde_json::to_vec(&manifest_b).unwrap()).unwrap();
+
+    let library = LibraryService::in_memory(Arc::clone(&ingest)).unwrap();
+    library.list().unwrap();
+    library.tag(&track_a, "funk").unwrap();
+    library.tag(&track_c, "funk").unwrap();
+    library.tag(&track_c, "practice").unwrap();
+
+    let by_name = library
+        .search(&LibraryQuery {
+            text: "funky".to_owned(),
+            tags: Vec::new(),
+            sort: LibrarySort::Name,
+        })
+        .unwrap();
+    assert_eq!(
+        by_name
+            .iter()
+            .map(|e| e.track_id.clone())
+            .collect::<Vec<_>>(),
+        vec![track_a.clone()]
+    );
+
+    let by_key = library
+        .search(&LibraryQuery {
+            text: "f# minor".to_owned(),
+            tags: Vec::new(),
+            sort: LibrarySort::Name,
+        })
+        .unwrap();
+    assert_eq!(by_key.len(), 1);
+    assert_eq!(by_key[0].track_id, track_b);
+
+    let by_tag_text = library
+        .search(&LibraryQuery {
+            text: "funk".to_owned(),
+            tags: Vec::new(),
+            sort: LibrarySort::Name,
+        })
+        .unwrap();
+    let mut ids: Vec<_> = by_tag_text.iter().map(|e| e.track_id.clone()).collect();
+    ids.sort();
+    let mut expected = vec![track_a.clone(), track_c.clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    let intersection = library
+        .search(&LibraryQuery {
+            text: String::new(),
+            tags: vec!["funk".to_owned(), "practice".to_owned()],
+            sort: LibrarySort::Name,
+        })
+        .unwrap();
+    assert_eq!(intersection.len(), 1);
+    assert_eq!(intersection[0].track_id, track_c);
+}
+
+#[test]
+fn search_escapes_literal_wildcard_characters() {
+    let temp = TempDir::new().unwrap();
+    let ingest = make_ingest(&temp);
+    let track_id = seed_track(&ingest, "100%_mix.mp3");
+    let _decoy = seed_track(&ingest, "unrelated.mp3");
+    let library = LibraryService::in_memory(Arc::clone(&ingest)).unwrap();
+    library.list().unwrap();
+
+    let matches = library
+        .search(&LibraryQuery {
+            text: "100%".to_owned(),
+            tags: Vec::new(),
+            sort: LibrarySort::Name,
+        })
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].track_id, track_id);
 }
 
 #[test]
