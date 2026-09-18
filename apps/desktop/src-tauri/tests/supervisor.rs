@@ -1,5 +1,9 @@
+use analyzer_domain::JobId;
+use analyzer_protocol::Method;
 use local_music_analyzer_desktop::supervisor::{SupervisorError, WorkerLaunch, WorkerSupervisor};
+use serde_json::json;
 use std::ffi::OsString;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -75,4 +79,32 @@ async fn detects_worker_death_after_healthy_handshake() {
         .await
         .expect_err("worker must not answer ping");
     assert!(matches!(error, SupervisorError::WorkerExited { .. }));
+}
+
+#[tokio::test]
+async fn forwards_progress_events_before_the_final_response() {
+    let temp = tempfile::TempDir::new().expect("temp workspace");
+    let source = temp.path().join("source.wav");
+    fs::write(&source, b"RIFF----WAVE").expect("source fixture");
+    let output = temp.path().join("output");
+    let mut worker = WorkerSupervisor::start(launch("separate_slow"))
+        .await
+        .expect("worker should start");
+    worker.ping().await.expect("worker should pong");
+
+    let mut seen = Vec::new();
+    let response = worker
+        .request_with_job_progress(
+            Method::Separate,
+            JobId::new(),
+            json!({"input_path": source, "output_dir": output}),
+            Duration::from_secs(1),
+            |event| seen.push(event.data.clone()),
+        )
+        .await
+        .expect("separation response");
+
+    assert_eq!(response.1.len(), 1);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["percent"], 0.5);
 }

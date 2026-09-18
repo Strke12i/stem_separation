@@ -1,5 +1,14 @@
+use local_music_analyzer_desktop::amt::{AmtReport, AmtService};
+use local_music_analyzer_desktop::audio::AudioManager;
 use local_music_analyzer_desktop::doctor::{DoctorReport, WorkerManager};
+use local_music_analyzer_desktop::harmony::{HarmonyReport, HarmonyService};
 use local_music_analyzer_desktop::ingest::{IngestService, IngestedTrack};
+use local_music_analyzer_desktop::pitch::{PitchReport, PitchService};
+use local_music_analyzer_desktop::rhythm::{RhythmReport, RhythmService};
+use local_music_analyzer_desktop::scheduler::ResourceScheduler;
+use local_music_analyzer_desktop::separation::{
+    ModelInfo, SeparationReport, SeparationService, SeparationStatus,
+};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -36,6 +45,248 @@ async fn pick_and_import(
     .map_err(|error| format!("Audio import task failed: {error}"))?
 }
 
+#[tauri::command]
+async fn load_original_track(
+    track_id: String,
+    ingest: tauri::State<'_, Arc<IngestService>>,
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    let ingest = Arc::clone(ingest.inner());
+    let audio = Arc::clone(audio.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let normalized_path = ingest
+            .normalized_source_for(&track_id)
+            .map_err(|error| error.to_string())?;
+        audio.load_normalized(&normalized_path)
+    })
+    .await
+    .map_err(|error| format!("Audio load task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn load_stem_mix(
+    track_id: String,
+    model_id: String,
+    separation: tauri::State<'_, Arc<SeparationService>>,
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    let separation = Arc::clone(separation.inner());
+    let audio = Arc::clone(audio.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let stems = separation
+            .stem_files(&track_id, &model_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|stem| analyzer_audio::StemInput {
+                stem: stem.stem,
+                path: stem.path,
+            })
+            .collect();
+        audio.load_stems(stems)
+    })
+    .await
+    .map_err(|error| format!("Stem mixer load task failed: {error}"))?
+}
+
+#[tauri::command]
+fn audio_state(
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.snapshot()
+}
+
+#[tauri::command]
+fn play_audio(
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.play()
+}
+
+#[tauri::command]
+fn pause_audio(
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.pause()
+}
+
+#[tauri::command]
+fn stop_audio(
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.stop()
+}
+
+#[tauri::command]
+fn seek_audio(
+    seconds: f64,
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.seek(seconds)
+}
+
+#[tauri::command]
+fn set_master_volume(
+    volume: f32,
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.set_volume(volume)
+}
+
+#[tauri::command]
+fn set_stem_volume(
+    stem: String,
+    volume: f32,
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.set_stem_volume(&stem, volume)
+}
+
+#[tauri::command]
+fn set_stem_muted(
+    stem: String,
+    muted: bool,
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.set_stem_muted(&stem, muted)
+}
+
+#[tauri::command]
+fn set_stem_solo(
+    stem: String,
+    solo: bool,
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.set_stem_solo(&stem, solo)
+}
+
+#[tauri::command]
+fn reopen_audio_device(
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<analyzer_audio::AudioState, String> {
+    audio.reopen_output_device()
+}
+
+#[tauri::command]
+fn separation_models(separation: tauri::State<'_, Arc<SeparationService>>) -> Vec<ModelInfo> {
+    separation.models()
+}
+
+#[tauri::command]
+async fn separate_track(
+    track_id: String,
+    model_id: String,
+    separation: tauri::State<'_, Arc<SeparationService>>,
+) -> Result<SeparationReport, String> {
+    Arc::clone(separation.inner())
+        .separate(track_id, model_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn cancel_separation(
+    track_id: String,
+    separation: tauri::State<'_, Arc<SeparationService>>,
+) -> Result<bool, String> {
+    Ok(separation.cancel_for_track(&track_id).await)
+}
+
+#[tauri::command]
+async fn separation_status(
+    track_id: String,
+    separation: tauri::State<'_, Arc<SeparationService>>,
+) -> Result<Option<SeparationStatus>, String> {
+    Ok(separation.status_for_track(&track_id).await)
+}
+
+#[tauri::command]
+async fn analyze_rhythm(
+    track_id: String,
+    rhythm: tauri::State<'_, Arc<RhythmService>>,
+) -> Result<RhythmReport, String> {
+    Arc::clone(rhythm.inner())
+        .analyze(track_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn cached_rhythm(
+    track_id: String,
+    rhythm: tauri::State<'_, Arc<RhythmService>>,
+) -> Result<Option<RhythmReport>, String> {
+    rhythm.cached(&track_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn analyze_harmony(
+    track_id: String,
+    harmony: tauri::State<'_, Arc<HarmonyService>>,
+) -> Result<HarmonyReport, String> {
+    Arc::clone(harmony.inner())
+        .analyze(track_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn cached_harmony(
+    track_id: String,
+    harmony: tauri::State<'_, Arc<HarmonyService>>,
+) -> Result<Option<HarmonyReport>, String> {
+    harmony.cached(&track_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn analyze_pitch(
+    track_id: String,
+    stem: String,
+    pitch: tauri::State<'_, Arc<PitchService>>,
+) -> Result<PitchReport, String> {
+    Arc::clone(pitch.inner())
+        .analyze(track_id, stem)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn cached_pitch(
+    track_id: String,
+    stem: String,
+    pitch: tauri::State<'_, Arc<PitchService>>,
+) -> Result<Option<PitchReport>, String> {
+    pitch
+        .cached(&track_id, &stem)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn transcribe_track(
+    track_id: String,
+    amt: tauri::State<'_, Arc<AmtService>>,
+) -> Result<AmtReport, String> {
+    Arc::clone(amt.inner())
+        .transcribe(track_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn cached_amt(
+    track_id: String,
+    amt: tauri::State<'_, Arc<AmtService>>,
+) -> Result<Option<AmtReport>, String> {
+    amt.cached(&track_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn export_amt_midi(
+    track_id: String,
+    amt: tauri::State<'_, Arc<AmtService>>,
+) -> Result<Vec<u8>, String> {
+    amt.midi_bytes(&track_id).map_err(|error| error.to_string())
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -44,11 +295,43 @@ fn main() {
 
     let workers = Arc::new(WorkerManager::development());
     let ingest = Arc::new(IngestService::development());
+    if let Err(error) = ingest.cleanup_stale_temporary() {
+        tracing::warn!(%error, "could not clean stale temporary workspaces at startup");
+    }
+    if let Err(error) = ingest.repair_interrupted_workspaces() {
+        tracing::warn!(%error, "could not repair interrupted workspaces at startup");
+    }
+    let audio = Arc::new(AudioManager::new());
+    let scheduler = Arc::new(ResourceScheduler::new());
+    let separation = Arc::new(SeparationService::new(
+        Arc::clone(&ingest),
+        Arc::clone(&workers),
+        Arc::clone(&scheduler),
+    ));
+    let rhythm = Arc::new(RhythmService::new(
+        Arc::clone(&ingest),
+        Arc::clone(&workers),
+    ));
+    let harmony = Arc::new(HarmonyService::new(
+        Arc::clone(&ingest),
+        Arc::clone(&workers),
+    ));
+    let pitch = Arc::new(PitchService::new(Arc::clone(&ingest), Arc::clone(&workers)));
+    let amt = Arc::new(AmtService::development(
+        Arc::clone(&ingest),
+        Arc::clone(&scheduler),
+    ));
     let startup_workers = Arc::clone(&workers);
 
     let result = tauri::Builder::default()
         .manage(workers)
         .manage(ingest)
+        .manage(audio)
+        .manage(separation)
+        .manage(rhythm)
+        .manage(harmony)
+        .manage(pitch)
+        .manage(amt)
         .setup(move |_app| {
             tauri::async_runtime::spawn(async move {
                 let report = startup_workers.doctor().await;
@@ -62,7 +345,32 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             doctor,
             restart_worker,
-            pick_and_import
+            pick_and_import,
+            load_original_track,
+            load_stem_mix,
+            audio_state,
+            play_audio,
+            pause_audio,
+            stop_audio,
+            seek_audio,
+            set_master_volume,
+            set_stem_volume,
+            set_stem_muted,
+            set_stem_solo,
+            reopen_audio_device,
+            separation_models,
+            separate_track,
+            cancel_separation,
+            separation_status,
+            analyze_rhythm,
+            cached_rhythm,
+            analyze_harmony,
+            cached_harmony,
+            analyze_pitch,
+            cached_pitch,
+            transcribe_track,
+            cached_amt,
+            export_amt_midi
         ])
         .run(tauri::generate_context!());
 

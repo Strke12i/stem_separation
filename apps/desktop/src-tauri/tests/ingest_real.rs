@@ -36,9 +36,11 @@ fn imports_and_normalizes_a_real_synthetic_mp3() {
         "FFmpeg could not create synthetic MP3"
     );
 
+    // The service must discover FFmpeg from the development environment itself;
+    // the explicit variables above are used only to create and inspect the fixture.
     let service = IngestService::new(
         temporary.path().join("workspace"),
-        MediaTools::new(ffprobe.clone(), ffmpeg),
+        MediaTools::development(),
     );
     let imported = service.import(&source).expect("real MP3 must import");
     let workspace = PathBuf::from(imported.workspace_path);

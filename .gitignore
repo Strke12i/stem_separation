@@ -7,5 +7,10 @@
 /python/*-worker/.mypy_cache/
 /python/*-worker/.pytest_cache/
 /python/*-worker/.ruff_cache/
+/python/*-worker/.package-build/
+/python/*-worker/.package-venv/
+/apps/desktop/src-tauri/binaries/*.exe
+/apps/desktop/src-tauri/workspace/
+/files/
 __pycache__/
 *.pyc

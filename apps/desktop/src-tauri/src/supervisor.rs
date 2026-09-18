@@ -1,5 +1,6 @@
+use analyzer_domain::JobId;
 use analyzer_protocol::{
-    Hello, Method, PROTOCOL_VERSION, Request, Response, WorkerMessage, validate_version,
+    Event, Hello, Method, PROTOCOL_VERSION, Request, Response, WorkerMessage, validate_version,
 };
 use serde_json::Value;
 use std::ffi::OsString;
@@ -72,6 +73,10 @@ pub enum SupervisorError {
     WorkerExited { status: String },
     #[error("analysis worker rejected {method}: {message}")]
     WorkerRejected { method: String, message: String },
+    #[error("analysis worker ran out of memory; reduce the model or use a smaller input")]
+    WorkerOutOfMemory,
+    #[error("analysis worker exceeded the automatic restart limit; restart it manually")]
+    RestartLimit,
     #[error("I/O while communicating with analysis worker: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -150,7 +155,68 @@ impl WorkerSupervisor {
     }
 
     pub async fn request(&mut self, method: Method) -> Result<Response, SupervisorError> {
-        let request = Request::new(method.clone());
+        let request_timeout = self.launch.request_timeout;
+        let (response, _) = self
+            .request_with_events(Request::new(method.clone()), request_timeout, |_| {})
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn request_with_job(
+        &mut self,
+        method: Method,
+        job_id: JobId,
+        params: Value,
+    ) -> Result<(Response, Vec<Event>), SupervisorError> {
+        let request_timeout = self.launch.request_timeout;
+        self.request_with_job_timeout(method, job_id, params, request_timeout)
+            .await
+    }
+
+    pub async fn request_with_job_timeout(
+        &mut self,
+        method: Method,
+        job_id: JobId,
+        params: Value,
+        request_timeout: Duration,
+    ) -> Result<(Response, Vec<Event>), SupervisorError> {
+        self.request_with_events(
+            Request::with_job(method, job_id, params),
+            request_timeout,
+            |_| {},
+        )
+        .await
+    }
+
+    pub async fn request_with_job_progress<F>(
+        &mut self,
+        method: Method,
+        job_id: JobId,
+        params: Value,
+        request_timeout: Duration,
+        on_event: F,
+    ) -> Result<(Response, Vec<Event>), SupervisorError>
+    where
+        F: FnMut(&Event),
+    {
+        self.request_with_events(
+            Request::with_job(method, job_id, params),
+            request_timeout,
+            on_event,
+        )
+        .await
+    }
+
+    async fn request_with_events<F>(
+        &mut self,
+        request: Request,
+        request_timeout: Duration,
+        mut on_event: F,
+    ) -> Result<(Response, Vec<Event>), SupervisorError>
+    where
+        F: FnMut(&Event),
+    {
+        let method = request.method.clone();
         let request_id = request.request_id.clone();
         let encoded = serde_json::to_string(&request).map_err(SupervisorError::MalformedJson)?;
         debug!(request_id = %request_id, method = ?method, "sending worker request");
@@ -158,39 +224,55 @@ impl WorkerSupervisor {
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
 
-        let line = match timeout(self.launch.request_timeout, self.stdout.next_line()).await {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => return Err(self.unexpected_exit().await),
-            Ok(Err(error)) => return Err(SupervisorError::Io(error)),
-            Err(_) => return Err(SupervisorError::Timeout { phase: "request" }),
-        };
-
-        let message: WorkerMessage =
-            serde_json::from_str(&line).map_err(SupervisorError::MalformedJson)?;
-        match message {
-            WorkerMessage::Response(response) => {
-                validate_version(response.protocol_version)?;
-                if response.request_id != request_id {
-                    return Err(SupervisorError::UnexpectedMessage(
-                        "response request_id did not match",
-                    ));
+        let mut events = Vec::new();
+        loop {
+            let line = match timeout(request_timeout, self.stdout.next_line()).await {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => return Err(self.unexpected_exit().await),
+                Ok(Err(error)) => return Err(SupervisorError::Io(error)),
+                Err(_) => return Err(SupervisorError::Timeout { phase: "request" }),
+            };
+            let message: WorkerMessage =
+                serde_json::from_str(&line).map_err(SupervisorError::MalformedJson)?;
+            match message {
+                WorkerMessage::Response(response) => {
+                    validate_version(response.protocol_version)?;
+                    if response.request_id != request_id {
+                        return Err(SupervisorError::UnexpectedMessage(
+                            "response request_id did not match",
+                        ));
+                    }
+                    if response.ok {
+                        return Ok((response, events));
+                    } else {
+                        if response
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.code == "MODEL_OUT_OF_MEMORY")
+                        {
+                            return Err(SupervisorError::WorkerOutOfMemory);
+                        }
+                        let message = response.error.as_ref().map_or_else(
+                            || "unknown worker error".to_owned(),
+                            |error| error.message.clone(),
+                        );
+                        return Err(SupervisorError::WorkerRejected {
+                            method: format!("{method:?}"),
+                            message,
+                        });
+                    }
                 }
-                if response.ok {
-                    Ok(response)
-                } else {
-                    let message = response.error.as_ref().map_or_else(
-                        || "unknown worker error".to_owned(),
-                        |error| error.message.clone(),
-                    );
-                    Err(SupervisorError::WorkerRejected {
-                        method: format!("{method:?}"),
-                        message,
-                    })
+                WorkerMessage::Event(event) => {
+                    validate_version(event.protocol_version)?;
+                    if event.job_id != request.job_id {
+                        return Err(SupervisorError::UnexpectedMessage(
+                            "event job_id did not match request",
+                        ));
+                    }
+                    on_event(&event);
+                    events.push(event);
                 }
             }
-            WorkerMessage::Event(_) => Err(SupervisorError::UnexpectedMessage(
-                "event received where a response was expected",
-            )),
         }
     }
 

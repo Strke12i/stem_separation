@@ -11,6 +11,7 @@ tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
 analyzer-domain = { path = "../../../crates/analyzer-domain" }
+analyzer-audio = { path = "../../../crates/analyzer-audio" }
 analyzer-protocol = { path = "../../../crates/analyzer-protocol" }
 serde.workspace = true
 serde_json.workspace = true

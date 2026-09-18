@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from pathlib import Path
 
 PROTOCOL_VERSION = 1
 
@@ -37,6 +38,34 @@ def respond(request: dict[str, object]) -> None:
     )
 
 
+def respond_separation(request: dict[str, object]) -> None:
+    params = request["params"]
+    if not isinstance(params, dict):
+        return
+    output = Path(str(params["output_dir"]))
+    output.mkdir(parents=True)
+    source = Path(str(params["input_path"]))
+    stems = ["vocals", "drums", "bass", "other"]
+    for stem in stems:
+        (output / f"{stem}.wav").write_bytes(source.read_bytes())
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "event", "job_id": request["job_id"], "event": "progress", "data": {"stage": "separating", "percent": 0.5}})
+    if sys.argv[1] == "separate_slow":
+        time.sleep(0.3)
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"engine": "test-copy", "model_id": "demucs-4", "stems": [{"stem": stem, "relative_path": f"{stem}.wav"} for stem in stems]}})
+
+
+def respond_rhythm(request: dict[str, object]) -> None:
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "event", "job_id": request["job_id"], "event": "progress", "data": {"stage": "estimating_onsets", "percent": 0.5}})
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"bpm": 120.0, "beat_times": [0.5, 1.0, 1.5, 2.0], "algorithm": "librosa.beat", "stability_score": 1.0}})
+
+
+def respond_pitch(request: dict[str, object]) -> None:
+    params = request["params"]
+    stem = params.get("stem") if isinstance(params, dict) else "bass"
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "event", "job_id": request["job_id"], "event": "progress", "data": {"stage": "segmenting_notes", "percent": 0.8}})
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"stem": stem, "engine": "pyin", "notes": [{"start": 0.0, "end": 1.0, "midi": 45, "note": "A2", "confidence": 0.9, "stem": stem, "engine": "pyin"}]}})
+
+
 def main() -> None:
     mode = sys.argv[1]
     if mode == "exit_before_hello":
@@ -66,7 +95,14 @@ def main() -> None:
     line = sys.stdin.readline()
     if line:
         request = json.loads(line)
-        respond(request)
+        if mode in {"separate", "separate_slow"} and request.get("method") == "separate":
+            respond_separation(request)
+        elif mode == "rhythm" and request.get("method") == "analyze_rhythm":
+            respond_rhythm(request)
+        elif mode == "pitch" and request.get("method") == "analyze_pitch":
+            respond_pitch(request)
+        else:
+            respond(request)
 
 
 if __name__ == "__main__":

@@ -87,6 +87,8 @@ pub struct Artifact {
     pub kind: ArtifactKind,
     pub relative_path: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stem: Option<StemKind>,
     pub created_by: CreatedBy,
 }
 
@@ -95,6 +97,33 @@ pub struct Artifact {
 pub enum ArtifactKind {
     Source,
     NormalizedSource,
+    Stem,
+    Analysis,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum StemKind {
+    Vocals,
+    Drums,
+    Bass,
+    Other,
+    Guitar,
+    Piano,
+}
+
+impl StemKind {
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Vocals => "vocals",
+            Self::Drums => "drums",
+            Self::Bass => "bass",
+            Self::Other => "other",
+            Self::Guitar => "guitar",
+            Self::Piano => "piano",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

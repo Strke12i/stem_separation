@@ -49,6 +49,11 @@ pub enum Method {
     InspectCapabilities,
     Shutdown,
     Cancel,
+    Separate,
+    AnalyzeRhythm,
+    AnalyzeHarmony,
+    AnalyzePitch,
+    Transcribe,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -134,6 +139,15 @@ impl Request {
             job_id: None,
             method,
             params: Value::Object(Default::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_job(method: Method, job_id: JobId, params: Value) -> Self {
+        Self {
+            job_id: Some(job_id),
+            params,
+            ..Self::new(method)
         }
     }
 }

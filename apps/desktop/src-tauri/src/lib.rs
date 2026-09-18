@@ -1,3 +1,10 @@
+pub mod amt;
+pub mod audio;
 pub mod doctor;
+pub mod harmony;
 pub mod ingest;
+pub mod pitch;
+pub mod rhythm;
+pub mod scheduler;
+pub mod separation;
 pub mod supervisor;
