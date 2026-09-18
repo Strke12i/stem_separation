@@ -3,6 +3,9 @@ use local_music_analyzer_desktop::audio::AudioManager;
 use local_music_analyzer_desktop::doctor::{DoctorReport, WorkerManager};
 use local_music_analyzer_desktop::harmony::{HarmonyReport, HarmonyService};
 use local_music_analyzer_desktop::ingest::{IngestService, IngestedTrack};
+use local_music_analyzer_desktop::library::{
+    LibraryEntry, LibraryQuery, LibraryService, LibrarySyncReport, LibraryTag,
+};
 use local_music_analyzer_desktop::pitch::{PitchReport, PitchService};
 use local_music_analyzer_desktop::rhythm::{RhythmReport, RhythmService};
 use local_music_analyzer_desktop::scheduler::ResourceScheduler;
@@ -28,9 +31,10 @@ async fn restart_worker(
 #[tauri::command]
 async fn pick_and_import(
     state: tauri::State<'_, Arc<IngestService>>,
+    library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<Option<IngestedTrack>, String> {
     let ingest = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    let imported = tauri::async_runtime::spawn_blocking(move || {
         let selected = rfd::FileDialog::new()
             .add_filter(
                 "Audio",
@@ -42,7 +46,13 @@ async fn pick_and_import(
             .transpose()
     })
     .await
-    .map_err(|error| format!("Audio import task failed: {error}"))?
+    .map_err(|error| format!("Audio import task failed: {error}"))??;
+    if let Some(track) = &imported {
+        if let Err(error) = library.refresh(&track.track_id) {
+            tracing::warn!(%error, "could not refresh the library index after import");
+        }
+    }
+    Ok(imported)
 }
 
 #[tauri::command]
@@ -176,11 +186,16 @@ async fn separate_track(
     track_id: String,
     model_id: String,
     separation: tauri::State<'_, Arc<SeparationService>>,
+    library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<SeparationReport, String> {
-    Arc::clone(separation.inner())
-        .separate(track_id, model_id)
+    let result = Arc::clone(separation.inner())
+        .separate(track_id.clone(), model_id)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = library.refresh(&track_id) {
+        tracing::warn!(%error, "could not refresh the library index after separation");
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -203,11 +218,16 @@ async fn separation_status(
 async fn analyze_rhythm(
     track_id: String,
     rhythm: tauri::State<'_, Arc<RhythmService>>,
+    library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<RhythmReport, String> {
-    Arc::clone(rhythm.inner())
-        .analyze(track_id)
+    let result = Arc::clone(rhythm.inner())
+        .analyze(track_id.clone())
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = library.refresh(&track_id) {
+        tracing::warn!(%error, "could not refresh the library index after rhythm analysis");
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -222,11 +242,16 @@ fn cached_rhythm(
 async fn analyze_harmony(
     track_id: String,
     harmony: tauri::State<'_, Arc<HarmonyService>>,
+    library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<HarmonyReport, String> {
-    Arc::clone(harmony.inner())
-        .analyze(track_id)
+    let result = Arc::clone(harmony.inner())
+        .analyze(track_id.clone())
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = library.refresh(&track_id) {
+        tracing::warn!(%error, "could not refresh the library index after harmony analysis");
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -242,11 +267,16 @@ async fn analyze_pitch(
     track_id: String,
     stem: String,
     pitch: tauri::State<'_, Arc<PitchService>>,
+    library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<PitchReport, String> {
-    Arc::clone(pitch.inner())
-        .analyze(track_id, stem)
+    let result = Arc::clone(pitch.inner())
+        .analyze(track_id.clone(), stem)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = library.refresh(&track_id) {
+        tracing::warn!(%error, "could not refresh the library index after pitch analysis");
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -264,11 +294,16 @@ fn cached_pitch(
 async fn transcribe_track(
     track_id: String,
     amt: tauri::State<'_, Arc<AmtService>>,
+    library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<AmtReport, String> {
-    Arc::clone(amt.inner())
-        .transcribe(track_id)
+    let result = Arc::clone(amt.inner())
+        .transcribe(track_id.clone())
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = library.refresh(&track_id) {
+        tracing::warn!(%error, "could not refresh the library index after transcription");
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -287,6 +322,65 @@ fn export_amt_midi(
     amt.midi_bytes(&track_id).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn library_list(
+    library: tauri::State<'_, Arc<LibraryService>>,
+) -> Result<Vec<LibraryEntry>, String> {
+    library.list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_search(
+    query: LibraryQuery,
+    library: tauri::State<'_, Arc<LibraryService>>,
+) -> Result<Vec<LibraryEntry>, String> {
+    library.search(&query).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_tags(library: tauri::State<'_, Arc<LibraryService>>) -> Result<Vec<LibraryTag>, String> {
+    library.tags().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_add_tag(
+    track_id: String,
+    tag: String,
+    library: tauri::State<'_, Arc<LibraryService>>,
+) -> Result<LibraryEntry, String> {
+    library
+        .tag(&track_id, &tag)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_remove_tag(
+    track_id: String,
+    tag: String,
+    library: tauri::State<'_, Arc<LibraryService>>,
+) -> Result<LibraryEntry, String> {
+    library
+        .untag(&track_id, &tag)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_open_track(
+    track_id: String,
+    library: tauri::State<'_, Arc<LibraryService>>,
+) -> Result<LibraryEntry, String> {
+    library
+        .touch_opened(&track_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn library_rebuild(
+    library: tauri::State<'_, Arc<LibraryService>>,
+) -> Result<LibrarySyncReport, String> {
+    library.rebuild().map_err(|error| error.to_string())
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -300,6 +394,25 @@ fn main() {
     }
     if let Err(error) = ingest.repair_interrupted_workspaces() {
         tracing::warn!(%error, "could not repair interrupted workspaces at startup");
+    }
+    let library = Arc::new(match LibraryService::open(Arc::clone(&ingest)) {
+        Ok(service) => service,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not open the on-disk library index; using an in-memory index for this session"
+            );
+            // An in-memory SQLite connection has no filesystem dependency,
+            // so failing here indicates a systemic problem (e.g. memory
+            // exhaustion) rather than anything specific to the library
+            // feature; there is no reasonable degraded mode left to fall
+            // back to.
+            LibraryService::in_memory(Arc::clone(&ingest))
+                .expect("could not build even an in-memory library index")
+        }
+    });
+    if let Err(error) = library.reconcile() {
+        tracing::warn!(%error, "could not index the library at startup");
     }
     let audio = Arc::new(AudioManager::new());
     let scheduler = Arc::new(ResourceScheduler::new());
@@ -334,6 +447,7 @@ fn main() {
         .manage(harmony)
         .manage(pitch)
         .manage(amt)
+        .manage(library)
         .setup(move |_app| {
             tauri::async_runtime::spawn(async move {
                 let report = startup_workers.doctor().await;
@@ -372,7 +486,14 @@ fn main() {
             cached_pitch,
             transcribe_track,
             cached_amt,
-            export_amt_midi
+            export_amt_midi,
+            library_list,
+            library_search,
+            library_tags,
+            library_add_tag,
+            library_remove_tag,
+            library_open_track,
+            library_rebuild
         ])
         .build(tauri::generate_context!());
 
