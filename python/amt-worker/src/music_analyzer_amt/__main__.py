@@ -9,6 +9,8 @@ from typing import Any, TextIO
 from music_analyzer_amt import PROTOCOL_VERSION, WORKER_VERSION
 from music_analyzer_amt.transcribe import TranscriptionError, transcribe
 
+LOGGER = logging.getLogger(__name__)
+
 CAPABILITIES = ["ping", "inspect_capabilities", "transcribe", "shutdown"]
 
 
@@ -61,19 +63,33 @@ def handle(message: dict[str, Any], output: TextIO) -> tuple[dict[str, Any], boo
     request_id = message.get("request_id")
     method = message.get("method")
     job_id = message.get("job_id")
-    if not isinstance(request_id, str) or message.get("protocol_version") != PROTOCOL_VERSION:
+    job_id_str = job_id if isinstance(job_id, str) else None
+    # Check request_id first: once it is known valid, every error below can
+    # echo it back so Rust can still correlate the failure with the
+    # in-flight request instead of timing out.
+    if not isinstance(request_id, str):
         return answer(
             "unknown", error=ProtocolError("MALFORMED_REQUEST", "Invalid AMT request.")
         ), False
+    if message.get("protocol_version") != PROTOCOL_VERSION:
+        return answer(
+            request_id,
+            error=ProtocolError(
+                "PROTOCOL_MISMATCH",
+                f"Unsupported protocol version {message.get('protocol_version')!r}.",
+            ),
+        ), False
     if method == "ping":
-        return answer(request_id, result={"pong": True}), False
+        return answer(request_id, result={"pong": True}, job_id=job_id_str), False
     if method == "inspect_capabilities":
-        return answer(request_id, result={"capabilities": CAPABILITIES}), False
+        return answer(request_id, result={"capabilities": CAPABILITIES}, job_id=job_id_str), False
     if method == "shutdown":
-        return answer(request_id, result={"shutting_down": True}), True
+        return answer(request_id, result={"shutting_down": True}, job_id=job_id_str), True
     if method != "transcribe" or not isinstance(job_id, str):
         return answer(
-            request_id, error=ProtocolError("UNSUPPORTED_METHOD", "Unsupported AMT method.")
+            request_id,
+            error=ProtocolError("UNSUPPORTED_METHOD", "Unsupported AMT method."),
+            job_id=job_id_str,
         ), False
 
     def progress(stage: str, percent: float) -> None:
@@ -90,7 +106,9 @@ def handle(message: dict[str, Any], output: TextIO) -> tuple[dict[str, Any], boo
 
     try:
         return answer(
-            request_id, result=transcribe(message.get("params", {}), progress), job_id=job_id
+            request_id,
+            result=transcribe(message.get("params", {}), progress, job_id),
+            job_id=job_id,
         ), False
     except TranscriptionError as error:
         return answer(
@@ -123,7 +141,27 @@ def serve(input_stream: TextIO = sys.stdin, output: TextIO = sys.stdout) -> None
                 output,
             )
             continue
-        response, stop = handle(message, output)
+        try:
+            response, stop = handle(message, output)
+        except Exception:
+            # A single job must never take the whole worker down: an
+            # unclassified exception here would otherwise unwind through
+            # `serve` and exit the process, silently dropping this request
+            # and desynchronizing Rust.
+            LOGGER.exception("unhandled error handling request_id=%s", message.get("request_id"))
+            request_id = message.get("request_id")
+            job_id = message.get("job_id")
+            emit(
+                answer(
+                    request_id if isinstance(request_id, str) else "unknown",
+                    error=ProtocolError(
+                        "INTERNAL_ERROR", "The worker encountered an unexpected internal error."
+                    ),
+                    job_id=job_id if isinstance(job_id, str) else None,
+                ),
+                output,
+            )
+            continue
         emit(response, output)
         if stop:
             return

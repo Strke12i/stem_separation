@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -101,13 +102,20 @@ def chord_frames(chroma: np.ndarray[Any, Any]) -> tuple[list[str], list[float]]:
 
 
 def smooth(labels: list[str], width: int) -> list[str]:
-    return [
-        max(
-            set(labels[max(0, i - width) : min(len(labels), i + width + 1)]),
-            key=labels[max(0, i - width) : min(len(labels), i + width + 1)].count,
-        )
-        for i in range(len(labels))
-    ]
+    smoothed: list[str] = []
+    for i in range(len(labels)):
+        window = labels[max(0, i - width) : min(len(labels), i + width + 1)]
+        counts = Counter(window)
+        # Deterministic tiebreak: highest count wins; ties break by earliest
+        # position in the window. `set`/dict iteration order for str keys
+        # depends on PYTHONHASHSEED, which CPython randomizes per process, so
+        # picking a tied winner from set order let identical audio produce
+        # different chord boundaries across runs and silently broke the
+        # Rust-side cache-key assumption that the same input always yields
+        # the same persisted result.
+        best_label = min(counts, key=lambda label: (-counts[label], window.index(label)))
+        smoothed.append(best_label)
+    return smoothed
 
 
 def segment(

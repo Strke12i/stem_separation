@@ -91,17 +91,20 @@ def parse_request(raw: str) -> tuple[dict[str, Any] | None, ProtocolError | None
 
     if not isinstance(message, dict):
         return None, ProtocolError("MALFORMED_REQUEST", "Request must be a JSON object.")
-    if message.get("type") != "request":
-        return None, ProtocolError("MALFORMED_REQUEST", "Message type must be 'request'.")
+    # Check request_id before any other field: once it is known valid, every
+    # error below can echo it back so Rust can still correlate the failure
+    # with the in-flight request instead of timing out.
     if not isinstance(message.get("request_id"), str):
         return None, ProtocolError("MALFORMED_REQUEST", "Request must include a string request_id.")
+    if message.get("type") != "request":
+        return message, ProtocolError("MALFORMED_REQUEST", "Message type must be 'request'.")
     if message.get("protocol_version") != PROTOCOL_VERSION:
-        return None, ProtocolError(
+        return message, ProtocolError(
             "PROTOCOL_MISMATCH",
             f"Unsupported protocol version {message.get('protocol_version')!r}.",
         )
     if not isinstance(message.get("method"), str):
-        return None, ProtocolError("MALFORMED_REQUEST", "Request must include a string method.")
+        return message, ProtocolError("MALFORMED_REQUEST", "Request must include a string method.")
     return message, None
 
 
@@ -109,13 +112,14 @@ def handle_request(message: dict[str, Any], output: TextIO) -> tuple[dict[str, A
     request_id = str(message["request_id"])
     method = message["method"]
     job_id = message.get("job_id")
+    job_id_str = job_id if isinstance(job_id, str) else None
     LOGGER.info("request_id=%s method=%s", request_id, method)
     if method == "ping":
-        return response(request_id, {"pong": True}), False
+        return response(request_id, {"pong": True}, job_id_str), False
     if method == "inspect_capabilities":
-        return response(request_id, {"capabilities": CAPABILITIES}), False
+        return response(request_id, {"capabilities": CAPABILITIES}, job_id_str), False
     if method == "shutdown":
-        return response(request_id, {"shutting_down": True}), True
+        return response(request_id, {"shutting_down": True}, job_id_str), True
     if method == "separate":
         if not isinstance(job_id, str):
             return error_response(
@@ -135,7 +139,7 @@ def handle_request(message: dict[str, Any], output: TextIO) -> tuple[dict[str, A
             )
 
         try:
-            result = separate(message.get("params", {}), progress)
+            result = separate(message.get("params", {}), progress, job_id)
         except SeparationError as error:
             return error_response(
                 request_id,
@@ -230,6 +234,7 @@ def handle_request(message: dict[str, Any], output: TextIO) -> tuple[dict[str, A
                 f"Unsupported method: {method}.",
                 recoverable=False,
             ),
+            job_id_str,
         ),
         False,
     )
@@ -241,12 +246,36 @@ def serve(input_stream: TextIO = sys.stdin, output: TextIO = sys.stdout) -> None
     for raw_line in input_stream:
         request, parse_error = parse_request(raw_line)
         if parse_error is not None:
-            emit(error_response("unknown", parse_error), output)
+            request_id = request.get("request_id") if isinstance(request, dict) else None
+            known_id = request_id if isinstance(request_id, str) else "unknown"
+            emit(error_response(known_id, parse_error), output)
             continue
         if request is None:
             continue
 
-        payload, should_stop = handle_request(request, output)
+        try:
+            payload, should_stop = handle_request(request, output)
+        except Exception:
+            # A single job must never take the whole worker down: an
+            # unclassified exception here (OOM, an unstable library error)
+            # would otherwise unwind through `serve` and exit the process,
+            # silently dropping this request and desynchronizing Rust.
+            LOGGER.exception("unhandled error handling request_id=%s", request.get("request_id"))
+            request_id = request.get("request_id")
+            job_id = request.get("job_id")
+            emit(
+                error_response(
+                    request_id if isinstance(request_id, str) else "unknown",
+                    ProtocolError(
+                        "INTERNAL_ERROR",
+                        "The worker encountered an unexpected internal error.",
+                        recoverable=False,
+                    ),
+                    job_id if isinstance(job_id, str) else None,
+                ),
+                output,
+            )
+            continue
         emit(payload, output)
         if should_stop:
             return

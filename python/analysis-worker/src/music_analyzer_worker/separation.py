@@ -42,7 +42,9 @@ PROFILES = {
 }
 
 
-def separate(params: dict[str, Any], emit_progress: Callable[[str, float], None]) -> dict[str, Any]:
+def separate(
+    params: dict[str, Any], emit_progress: Callable[[str, float], None], job_id: str
+) -> dict[str, Any]:
     """Separate strictly inside a Rust-created temporary workspace."""
     profile = profile_from(params)
     workspace = required_path(params, "workspace_path")
@@ -51,8 +53,8 @@ def separate(params: dict[str, Any], emit_progress: Callable[[str, float], None]
     model_dir = required_path(params, "model_dir")
     assert_within(source, workspace, "input_path")
     assert_within(output, workspace, "output_dir")
-    if output.parent.name != "tmp" or not output.name.startswith("job-"):
-        raise SeparationError("INVALID_WORKSPACE", "Output directory is not a Rust job workspace.")
+    if output.parent.name != "tmp" or output.name != job_id:
+        raise SeparationError("INVALID_WORKSPACE", "Output directory does not match this job.")
     if not source.is_file():
         raise SeparationError("MISSING_INPUT", "Normalized source is unavailable.")
     if not model_dir.is_dir() or not (model_dir / ".lma-model.json").is_file():
@@ -66,7 +68,12 @@ def separate(params: dict[str, Any], emit_progress: Callable[[str, float], None]
     # so that import must complete before the guard is active. Importing a Python
     # module does not contact the network; model work remains inside the guard.
     separator_type = load_separator_type()
-    output.mkdir(parents=True, exist_ok=False)
+    try:
+        output.mkdir(parents=True, exist_ok=False)
+    except OSError as error:
+        raise SeparationError(
+            "INVALID_WORKSPACE", "Could not create the job output directory."
+        ) from error
     emit_progress("loading_model", 0.05)
     if os.environ.get("LOCAL_MUSIC_ANALYZER_TEST_SEPARATOR") == "copy":
         return copy_for_test(source, output, profile, emit_progress)
@@ -85,7 +92,7 @@ def separate(params: dict[str, Any], emit_progress: Callable[[str, float], None]
             produced = [Path(path) for path in separator.separate(str(source), names)]
     except SeparationError:
         raise
-    except OSError as error:
+    except _OfflineNetworkBlocked as error:
         raise SeparationError(
             "MODEL_NOT_INSTALLED",
             "The installed model bundle is incomplete; online retrieval is disabled.",
@@ -152,6 +159,16 @@ def verify_model_marker(model_dir: Path, profile: SeparationProfile) -> None:
         raise SeparationError("MODEL_NOT_INSTALLED", "Model configuration file is missing.")
 
 
+class _OfflineNetworkBlocked(OSError):
+    """Raised by the socket guard below; audio-separator attempted network access.
+
+    A distinct type (rather than a bare ``OSError``) so ``separate()`` can
+    tell "the offline guard fired" apart from a real disk/permission error
+    while writing stem WAVs, which must not be reported as a recoverable
+    model-installation problem.
+    """
+
+
 @contextmanager
 def offline_network() -> Iterator[None]:
     """Prevent audio-separator's convenience downloader from making a network request."""
@@ -159,7 +176,7 @@ def offline_network() -> Iterator[None]:
     original_socket = socket_module.socket
 
     def denied_socket(*args: Any, **kwargs: Any) -> socket.socket:
-        raise OSError("Local Music Analyzer runs audio-separator in offline mode")
+        raise _OfflineNetworkBlocked("Local Music Analyzer runs audio-separator in offline mode")
 
     socket_module.socket = denied_socket
     try:
