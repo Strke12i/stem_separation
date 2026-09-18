@@ -6,15 +6,18 @@ use analyzer_domain::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 const NORMALIZED_RELATIVE_PATH: &str = "normalized/source.wav";
@@ -88,10 +91,11 @@ fn winget_ffmpeg_in(packages_root: &Path, executable: &str) -> Option<PathBuf> {
     None
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct IngestService {
     workspace_root: PathBuf,
     tools: MediaTools,
+    manifest_locks: StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -153,7 +157,26 @@ impl IngestService {
         Self {
             workspace_root,
             tools,
+            manifest_locks: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// A per-track lock serializing manifest read-merge-write critical
+    /// sections across every analysis service (separation, rhythm, harmony,
+    /// pitch, amt). Each service still reads the manifest early to plan its
+    /// job, but must re-read it fresh under this lock immediately before
+    /// writing its result, so two jobs finishing back-to-back for the same
+    /// track never overwrite each other's already-promoted artifacts.
+    pub fn track_lock(&self, track_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .manifest_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .entry(track_id.to_owned())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
     }
 
     pub fn import(&self, selected_path: &Path) -> Result<IngestedTrack, IngestError> {

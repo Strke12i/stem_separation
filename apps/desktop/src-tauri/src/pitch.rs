@@ -113,7 +113,15 @@ impl PitchService {
         report.cache_hit = false;
         validate(&report, manifest.source.duration_seconds, &stem)?;
         write_json(&path, &report)?;
-        persist(&workspace, manifest, &stem, &signature, &report)?;
+        persist(
+            &self.ingest,
+            &track_id,
+            &workspace,
+            &stem,
+            &signature,
+            &report,
+        )
+        .await?;
         Ok(report)
     }
 
@@ -224,13 +232,21 @@ fn read_manifest(workspace: &Path) -> Result<TrackManifest, PitchError> {
     )?)?)
 }
 
-fn persist(
+async fn persist(
+    ingest: &IngestService,
+    track_id: &str,
     workspace: &Path,
-    mut manifest: TrackManifest,
     stem: &str,
     signature: &str,
     report: &PitchReport,
 ) -> Result<(), PitchError> {
+    // Re-read fresh under a per-track lock rather than reusing the manifest
+    // captured at job start: another analysis service may have finished and
+    // persisted its own artifacts while this job's worker was running, and
+    // writing back a stale in-memory copy would silently erase that work.
+    let lock = ingest.track_lock(track_id);
+    let _guard = lock.lock().await;
+    let mut manifest = read_manifest(workspace)?;
     let relative = format!("analysis/pitch/{stem}/{signature}/notes.json");
     let pitch = manifest
         .analysis

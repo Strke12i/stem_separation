@@ -271,7 +271,9 @@ impl SeparationService {
             cleanup_temporary_job(&temp_dir);
             return Err(error);
         }
-        if let Err(error) = persist_artifacts(&workspace, manifest, descriptor, &cache_key) {
+        if let Err(error) =
+            persist_artifacts(&self.ingest, &track_id, &workspace, descriptor, &cache_key).await
+        {
             self.clear_active(&job_id).await;
             return Err(error);
         }
@@ -582,12 +584,20 @@ fn promote(
     Ok(())
 }
 
-fn persist_artifacts(
+async fn persist_artifacts(
+    ingest: &IngestService,
+    track_id: &str,
     workspace: &Path,
-    mut manifest: TrackManifest,
     descriptor: &ModelDescriptor,
     cache_key: &str,
 ) -> Result<(), SeparationError> {
+    // Re-read fresh under a per-track lock rather than reusing the manifest
+    // captured at job start: another analysis service may have finished and
+    // persisted its own artifacts while this job's worker was running, and
+    // writing back a stale in-memory copy would silently erase that work.
+    let lock = ingest.track_lock(track_id);
+    let _guard = lock.lock().await;
+    let mut manifest = read_manifest(workspace)?;
     manifest.artifacts.retain(|artifact| {
         !(artifact.kind == ArtifactKind::Stem
             && artifact.created_by.model.as_deref() == Some(descriptor.id))

@@ -163,7 +163,7 @@ impl AmtService {
                 return Err(error);
             }
         };
-        persist(&workspace, manifest, &key, &report)?;
+        persist(&self.ingest, &track_id, &workspace, &key, &report).await?;
         Ok(report)
     }
 
@@ -328,12 +328,20 @@ fn read_manifest(workspace: &Path) -> Result<TrackManifest, AmtError> {
         workspace.join("manifest.json"),
     )?)?)
 }
-fn persist(
+async fn persist(
+    ingest: &IngestService,
+    track_id: &str,
     workspace: &Path,
-    mut manifest: TrackManifest,
     key: &str,
     report: &AmtReport,
 ) -> Result<(), AmtError> {
+    // Re-read fresh under a per-track lock rather than reusing the manifest
+    // captured at job start: another analysis service may have finished and
+    // persisted its own artifacts while this job's worker was running, and
+    // writing back a stale in-memory copy would silently erase that work.
+    let lock = ingest.track_lock(track_id);
+    let _guard = lock.lock().await;
+    let mut manifest = read_manifest(workspace)?;
     let relative = format!("analysis/amt/{key}/transcription.mid");
     manifest
         .analysis
