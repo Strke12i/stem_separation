@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from io import StringIO
 from pathlib import Path
@@ -112,6 +113,25 @@ def test_separation_emits_progress_and_only_relative_stems(
     (model_dir / ".lma-model.json").write_text(
         '{"model_id":"demucs-4","model_filename":"htdemucs.yaml"}', encoding="utf-8"
     )
+    config_hash = hashlib.sha256(b"local test config").hexdigest()
+    (model_dir / ".lma-bundle.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model_id": "demucs-4",
+                "model_filename": "htdemucs.yaml",
+                "installed_at": "2024-01-01T00:00:00Z",
+                "files": [
+                    {
+                        "relative_path": "htdemucs.yaml",
+                        "size_bytes": len(b"local test config"),
+                        "sha256": config_hash,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     output = workspace / "tmp" / "job-test"
     monkeypatch.setenv("LOCAL_MUSIC_ANALYZER_TEST_SEPARATOR", "copy")
     input_text = json.dumps(
@@ -144,3 +164,65 @@ def test_separation_emits_progress_and_only_relative_stems(
         "other",
     }
     assert all("/" not in stem["relative_path"] for stem in result["result"]["stems"])
+
+
+def test_separation_rejects_a_model_bundle_whose_checksum_no_longer_matches(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    workspace = tmp_path / "track-test"
+    normalized = workspace / "normalized" / "source.wav"
+    normalized.parent.mkdir(parents=True)
+    normalized.write_bytes(b"RIFF" + b"\x00" * 40 + b"WAVE")
+    model_dir = tmp_path / "models" / "demucs-4"
+    model_dir.mkdir(parents=True)
+    (model_dir / "htdemucs.yaml").write_text("local test config", encoding="utf-8")
+    (model_dir / ".lma-model.json").write_text(
+        '{"model_id":"demucs-4","model_filename":"htdemucs.yaml"}', encoding="utf-8"
+    )
+    # The inventory still claims the original checksum, but the file on disk
+    # has changed since install - simulating corruption or tampering.
+    stale_hash = hashlib.sha256(b"a different original config").hexdigest()
+    (model_dir / ".lma-bundle.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model_id": "demucs-4",
+                "model_filename": "htdemucs.yaml",
+                "installed_at": "2024-01-01T00:00:00Z",
+                "files": [
+                    {
+                        "relative_path": "htdemucs.yaml",
+                        "size_bytes": len(b"a different original config"),
+                        "sha256": stale_hash,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = workspace / "tmp" / "job-test"
+    monkeypatch.setenv("LOCAL_MUSIC_ANALYZER_TEST_SEPARATOR", "copy")
+    input_text = json.dumps(
+        {
+            "protocol_version": PROTOCOL_VERSION,
+            "type": "request",
+            "request_id": "req-separate",
+            "job_id": "job-test",
+            "method": "separate",
+            "params": {
+                "workspace_path": str(workspace),
+                "input_path": str(normalized),
+                "output_dir": str(output),
+                "model_id": "demucs-4",
+                "model_dir": str(model_dir),
+            },
+        }
+    )
+
+    messages = messages_for(input_text + "\n")
+
+    result = messages[-1]
+    assert result["ok"] is False
+    assert result["error"]["code"] == "MODEL_INTEGRITY_ERROR"
+    assert result["error"]["recoverable"] is False
+    assert not output.exists()

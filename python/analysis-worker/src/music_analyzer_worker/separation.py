@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -11,6 +12,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+
+# Verified once per worker process per model directory: hashing hundreds of
+# MB of weights on every job would be wasteful within one process's
+# lifetime, and a fresh worker process (started on crash/desync/restart)
+# always starts with an empty cache.
+_VERIFIED_BUNDLES: set[str] = set()
 
 
 class SeparationError(Exception):
@@ -157,6 +164,71 @@ def verify_model_marker(model_dir: Path, profile: SeparationProfile) -> None:
         )
     if not (model_dir / profile.filename).is_file():
         raise SeparationError("MODEL_NOT_INSTALLED", "Model configuration file is missing.")
+    verify_bundle_checksums(model_dir, profile)
+
+
+def verify_bundle_checksums(model_dir: Path, profile: SeparationProfile) -> None:
+    """Verify each bundle file's SHA-256 against the installer's inventory.
+
+    ``audio_separator`` loads these weights through ``torch.load`` with
+    ``weights_only=False``, which executes arbitrary pickled state; without
+    this check a corrupted download or a tampered local install would be
+    silently trusted. This is a defense-in-depth backstop: Rust already
+    verifies the same inventory before ever starting this job, but the
+    checkpoint is only actually deserialized here.
+    """
+    cache_key = str(model_dir.resolve())
+    if cache_key in _VERIFIED_BUNDLES:
+        return
+    try:
+        bundle = json.loads((model_dir / ".lma-bundle.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SeparationError(
+            "MODEL_INTEGRITY_ERROR",
+            "Model install inventory is missing or corrupt. Reinstall the model bundle.",
+        ) from error
+    files = bundle.get("files") if isinstance(bundle, dict) else None
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("schema_version") != 1
+        or bundle.get("model_id") != profile.model_id
+        or bundle.get("model_filename") != profile.filename
+        or not isinstance(files, list)
+        or not files
+        or not any(
+            isinstance(entry, dict) and entry.get("relative_path") == profile.filename
+            for entry in files
+        )
+    ):
+        raise SeparationError(
+            "MODEL_INTEGRITY_ERROR",
+            "Model install inventory does not match the expected model. "
+            "Reinstall the model bundle.",
+        )
+    resolved_dir = model_dir.resolve()
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise SeparationError("MODEL_INTEGRITY_ERROR", "Model install inventory is malformed.")
+        relative = entry.get("relative_path")
+        expected_hash = entry.get("sha256")
+        if not isinstance(relative, str) or not isinstance(expected_hash, str):
+            raise SeparationError("MODEL_INTEGRITY_ERROR", "Model install inventory is malformed.")
+        candidate = (model_dir / relative).resolve()
+        if candidate.parent != resolved_dir or not candidate.is_file():
+            raise SeparationError(
+                "MODEL_INTEGRITY_ERROR", f"Model file '{relative}' is missing or invalid."
+            )
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected_hash:
+            raise SeparationError(
+                "MODEL_INTEGRITY_ERROR",
+                f"Model file '{relative}' does not match its recorded checksum; the local "
+                "install may be corrupted or tampered with. Reinstall the model bundle.",
+            )
+    _VERIFIED_BUNDLES.add(cache_key)
 
 
 class _OfflineNetworkBlocked(OSError):

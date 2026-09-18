@@ -296,6 +296,30 @@ esta versão do `audio-separator` não fornece checksums oficiais fixos dos peso
 remotos. Uma futura UI de Model Manager deve usar manifest versionado com
 origem e hashes oficiais antes de oferecer distribuição pública.
 
+### Correção — Verificação de integridade do bundle de modelo
+
+Date: 2026-09-18
+Cause: O inventário `.lma-bundle.json` gravado pelo instalador já registrava
+SHA-256 por arquivo, mas nada no app em execução o lia. `SeparationService`
+só checava a existência de `<filename>` e `.lma-model.json`, e o worker
+Python carregava os pesos via `torch.load(weights_only=False)` sem qualquer
+verificação — um download corrompido ou uma instalação adulterada era
+confiada silenciosamente antes da desserialização do pickle.
+Fix: Rust agora lê `.lma-bundle.json` e recalcula o SHA-256 de cada arquivo
+listado antes de iniciar uma separação, com o resultado — sucesso ou motivo
+da falha — mantido em cache por modelo pelo tempo de vida do processo, para
+não hashear centenas de MB de pesos a cada job. O worker Python repete a
+mesma verificação (também com cache por processo) imediatamente antes de
+`load_model`, como última barreira antes da desserialização.
+Tests: Novo teste Rust `rejects_a_model_bundle_whose_checksum_no_longer_matches`
+e teste Python equivalente cobrindo o worker isoladamente; ambos verificados
+como capazes de falhar sem a correção antes de serem restaurados. `cargo fmt`,
+clippy, testes Rust, `ruff`, `mypy` e `pytest` do analysis-worker passaram.
+Known limitations: A verificação por processo/sessão não detecta uma
+substituição do arquivo depois de já verificado nessa mesma sessão; um
+Model Manager futuro com manifest de origem oficial continua sendo o
+caminho para distribuição pública.
+
 ### Correção de ambiente — FFprobe no Windows
 
 Date: 2026-08-28

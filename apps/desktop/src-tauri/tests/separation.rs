@@ -4,6 +4,7 @@ use local_music_analyzer_desktop::ingest::{IngestService, MediaTools};
 use local_music_analyzer_desktop::scheduler::ResourceScheduler;
 use local_music_analyzer_desktop::separation::SeparationService;
 use local_music_analyzer_desktop::supervisor::WorkerLaunch;
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
@@ -69,6 +70,14 @@ fn prepare_workspace(temp: &TempDir) -> (Arc<IngestService>, String) {
     fs::write(
         model.join(".lma-model.json"),
         r#"{"model_id":"demucs-4","model_filename":"htdemucs.yaml"}"#,
+    )
+    .unwrap();
+    let config_hash = format!("{:x}", Sha256::digest(b"fixture"));
+    fs::write(
+        model.join(".lma-bundle.json"),
+        format!(
+            r#"{{"schema_version":1,"model_id":"demucs-4","model_filename":"htdemucs.yaml","installed_at":"2024-01-01T00:00:00Z","files":[{{"relative_path":"htdemucs.yaml","size_bytes":7,"sha256":"{config_hash}"}}]}}"#
+        ),
     )
     .unwrap();
     (
@@ -157,5 +166,36 @@ async fn cancellation_never_promotes_partial_outputs() {
     let error = running.await.unwrap().unwrap_err();
     assert!(error.to_string().contains("cancelled"));
     let workspace = ingest.workspace_for(&track_id).unwrap();
+    assert!(!workspace.join("stems/demucs-4").exists());
+}
+
+#[tokio::test]
+async fn rejects_a_model_bundle_whose_checksum_no_longer_matches() {
+    let temp = TempDir::new().unwrap();
+    let (ingest, track_id) = prepare_workspace(&temp);
+    // Simulate corruption/tampering since install: the bundle inventory still
+    // claims the original checksum, but the file on disk has changed.
+    let workspace = ingest.workspace_for(&track_id).unwrap();
+    let model = workspace.parent().unwrap().join("models").join("demucs-4");
+    fs::write(model.join("htdemucs.yaml"), "tampered").unwrap();
+
+    let mut launch = WorkerLaunch::new(
+        python(),
+        vec![fixture().into_os_string(), "separate".into()],
+        Duration::from_secs(1),
+    );
+    launch.request_timeout = Duration::from_secs(1);
+    let service = SeparationService::new(
+        Arc::clone(&ingest),
+        Arc::new(WorkerManager::new(launch)),
+        Arc::new(ResourceScheduler::new()),
+    );
+
+    let error = service
+        .separate(track_id.clone(), "demucs-4".to_owned())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("checksum"));
+    // No separation attempt should have run against the tampered bundle.
     assert!(!workspace.join("stems/demucs-4").exists());
 }

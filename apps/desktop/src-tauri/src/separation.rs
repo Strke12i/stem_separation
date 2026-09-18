@@ -7,9 +7,10 @@ use analyzer_domain::{
     Artifact, ArtifactKind, CreatedBy, JobId, JobStatus, StemKind, TrackManifest,
 };
 use analyzer_protocol::Event;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -68,6 +69,11 @@ pub struct SeparationService {
     scheduler: Arc<ResourceScheduler>,
     execution: Mutex<()>,
     active: Mutex<Option<ActiveJob>>,
+    // Verifying a model bundle's checksums means hashing hundreds of MB of
+    // weights; that cost is paid at most once per model per app session
+    // instead of on every separation, while still catching a corrupted or
+    // tampered local install since the process started.
+    bundle_verified: Mutex<HashMap<String, Result<(), String>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +107,8 @@ pub enum SeparationError {
     InvalidStem(String),
     #[error("Separation was cancelled before artifacts were promoted.")]
     Cancelled,
+    #[error("{0}")]
+    ModelIntegrity(String),
 }
 
 impl SeparationService {
@@ -116,6 +124,7 @@ impl SeparationService {
             scheduler,
             execution: Mutex::new(()),
             active: Mutex::new(None),
+            bundle_verified: Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,9 +169,11 @@ impl SeparationService {
             .unwrap_or(&workspace)
             .join("models")
             .join(descriptor.id);
-        if !model_is_installed(model_dir.parent().unwrap_or(&model_dir), descriptor) {
+        let models_root = model_dir.parent().unwrap_or(&model_dir);
+        if !model_is_installed(models_root, descriptor) {
             return Err(SeparationError::ModelNotInstalled(descriptor.id.to_owned()));
         }
+        self.ensure_bundle_verified(models_root, descriptor).await?;
         let manifest = read_manifest(&workspace)?;
         let cache_key = cache_key(&manifest.source.sha256, descriptor);
         let final_dir = workspace.join("stems").join(descriptor.id).join(&cache_key);
@@ -379,6 +390,105 @@ impl SeparationService {
             *active = None;
         }
     }
+
+    async fn ensure_bundle_verified(
+        &self,
+        models_root: &Path,
+        descriptor: &ModelDescriptor,
+    ) -> Result<(), SeparationError> {
+        if let Some(cached) = self.bundle_verified.lock().await.get(descriptor.id) {
+            return cached.clone().map_err(SeparationError::ModelIntegrity);
+        }
+        let outcome = verify_model_bundle(models_root, descriptor);
+        let cached: Result<(), String> = match &outcome {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        self.bundle_verified
+            .lock()
+            .await
+            .insert(descriptor.id.to_owned(), cached);
+        outcome
+    }
+}
+
+#[derive(Deserialize)]
+struct BundleFile {
+    relative_path: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+struct BundleManifest {
+    schema_version: u32,
+    model_id: String,
+    model_filename: String,
+    files: Vec<BundleFile>,
+}
+
+/// Verifies a model bundle's files against the per-file SHA-256 inventory
+/// `scripts/install-demucs.ps1` records at install time. `audio-separator`
+/// loads these weights with `torch.load(weights_only=False)`, which executes
+/// arbitrary pickled state; without this check a corrupted download or a
+/// tampered local install would be silently trusted.
+fn verify_model_bundle(
+    models_root: &Path,
+    descriptor: &ModelDescriptor,
+) -> Result<(), SeparationError> {
+    let directory = models_root.join(descriptor.id);
+    let bundle_path = directory.join(".lma-bundle.json");
+    let bytes = fs::read(&bundle_path).map_err(|_| {
+        SeparationError::ModelIntegrity(format!(
+            "Missing install inventory for model '{}'. Reinstall the model bundle with install-demucs.ps1.",
+            descriptor.id
+        ))
+    })?;
+    let bundle: BundleManifest = serde_json::from_slice(&bytes).map_err(|_| {
+        SeparationError::ModelIntegrity(format!(
+            "Install inventory for model '{}' is corrupt. Reinstall the model bundle.",
+            descriptor.id
+        ))
+    })?;
+    if bundle.schema_version != 1
+        || bundle.model_id != descriptor.id
+        || bundle.model_filename != descriptor.filename
+        || bundle.files.is_empty()
+        || !bundle
+            .files
+            .iter()
+            .any(|file| file.relative_path == descriptor.filename)
+    {
+        return Err(SeparationError::ModelIntegrity(format!(
+            "Install inventory for model '{}' does not match the expected model. Reinstall the model bundle.",
+            descriptor.id
+        )));
+    }
+    for file in &bundle.files {
+        let relative = Path::new(&file.relative_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(SeparationError::ModelIntegrity(format!(
+                "Install inventory for model '{}' references an invalid file path.",
+                descriptor.id
+            )));
+        }
+        let actual = file_hash(&directory.join(relative)).map_err(|_| {
+            SeparationError::ModelIntegrity(format!(
+                "Model file '{}' for '{}' is missing or unreadable. Reinstall the model bundle.",
+                file.relative_path, descriptor.id
+            ))
+        })?;
+        if actual != file.sha256 {
+            return Err(SeparationError::ModelIntegrity(format!(
+                "Model file '{}' for '{}' does not match its recorded checksum; the local install may be corrupted or tampered with. Reinstall the model bundle.",
+                file.relative_path, descriptor.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
