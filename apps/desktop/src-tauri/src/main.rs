@@ -322,8 +322,10 @@ fn main() {
         Arc::clone(&scheduler),
     ));
     let startup_workers = Arc::clone(&workers);
+    let exit_workers = Arc::clone(&workers);
+    let exit_amt = Arc::clone(&amt);
 
-    let result = tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(workers)
         .manage(ingest)
         .manage(audio)
@@ -372,9 +374,24 @@ fn main() {
             cached_amt,
             export_amt_midi
         ])
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!());
 
-    if let Err(error) = result {
-        tracing::error!(%error, "failed to run Tauri desktop application");
+    match app {
+        Ok(app) => app.run(move |_app_handle, event| {
+            // Sidecar children are spawned with `kill_on_drop`, but that only
+            // fires once every Arc<WorkerManager/AmtService> is dropped, which
+            // is not guaranteed to happen before the process itself exits.
+            // Shut them down explicitly and synchronously on the way out so a
+            // `uv`/python child holding model memory never outlives the app.
+            if let tauri::RunEvent::Exit = event {
+                let workers = Arc::clone(&exit_workers);
+                let amt = Arc::clone(&exit_amt);
+                tauri::async_runtime::block_on(async move {
+                    workers.shutdown().await;
+                    amt.shutdown().await;
+                });
+            }
+        }),
+        Err(error) => tracing::error!(%error, "failed to build Tauri desktop application"),
     }
 }

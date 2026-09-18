@@ -332,6 +332,10 @@ impl AudioEngine {
         let output = self.output.as_ref().ok_or(AudioError::NoTrack)?;
         let volumes = self.effective_volumes();
         let mut players = Vec::with_capacity(track.sources.len());
+        // Every source is opened, decoded, and seeked before any of them are
+        // started: starting each player as soon as it is ready (the previous
+        // approach) let later stems begin audibly later than earlier ones on
+        // a multi-stem mix, growing with file size and cold cache.
         for (source, volume) in track.sources.iter().zip(volumes) {
             let file = File::open(&source.path).map_err(|_| AudioError::MissingAudio)?;
             let decoder = Decoder::try_from(file).map_err(|error| AudioError::Decode {
@@ -348,10 +352,12 @@ impl AudioEngine {
                         detail: error.to_string(),
                     })?;
             }
-            if play {
+            players.push(player);
+        }
+        if play {
+            for player in &players {
                 player.play();
             }
-            players.push(player);
         }
         self.last_device_error = None;
         self.players = players;

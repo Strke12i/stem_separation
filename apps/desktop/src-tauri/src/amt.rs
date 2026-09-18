@@ -128,22 +128,41 @@ impl AmtService {
                 json!({"workspace_path":workspace,"input_path":input,"output_dir":temp}),
             )
             .await;
-        let value = result?;
-        let mut report: AmtReport =
-            serde_json::from_value(value).map_err(|_| AmtError::InvalidResult)?;
-        report.midi_artifact = "transcription.mid".to_owned();
-        report.cache_hit = false;
-        validate(&report, manifest.source.duration_seconds)?;
-        let midi = temp.join("transcription.mid");
-        if !valid_midi(&midi)? {
-            return Err(AmtError::InvalidResult);
-        }
-        fs::create_dir_all(final_dir.parent().ok_or(AmtError::InvalidResult)?)?;
-        if final_dir.exists() {
-            return Err(AmtError::InvalidResult);
-        }
-        write_json(&temp.join("transcription.json"), &report)?;
-        fs::rename(&temp, &final_dir)?;
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                cleanup_temporary_job(&temp);
+                return Err(error);
+            }
+        };
+        // Every failure below happens after the worker already wrote into
+        // `temp`; clean it up on every path, not only the happy one, so a
+        // bad transcription never leaks a full-size MIDI/notes temp dir.
+        let outcome = (|| -> Result<AmtReport, AmtError> {
+            let mut report: AmtReport =
+                serde_json::from_value(value).map_err(|_| AmtError::InvalidResult)?;
+            report.midi_artifact = "transcription.mid".to_owned();
+            report.cache_hit = false;
+            validate(&report, manifest.source.duration_seconds)?;
+            let midi = temp.join("transcription.mid");
+            if !valid_midi(&midi)? {
+                return Err(AmtError::InvalidResult);
+            }
+            fs::create_dir_all(final_dir.parent().ok_or(AmtError::InvalidResult)?)?;
+            if final_dir.exists() {
+                return Err(AmtError::InvalidResult);
+            }
+            write_json(&temp.join("transcription.json"), &report)?;
+            fs::rename(&temp, &final_dir)?;
+            Ok(report)
+        })();
+        let report = match outcome {
+            Ok(report) => report,
+            Err(error) => {
+                cleanup_temporary_job(&temp);
+                return Err(error);
+            }
+        };
         persist(&workspace, manifest, &key, &report)?;
         Ok(report)
     }
@@ -165,6 +184,15 @@ impl AmtService {
         validate(&report, manifest.source.duration_seconds)?;
         report.cache_hit = true;
         Ok(Some(report))
+    }
+
+    pub async fn shutdown(&self) {
+        let mut worker = self.worker.lock().await;
+        if let Some(mut active) = worker.take() {
+            if let Err(error) = active.shutdown().await {
+                tracing::warn!(error = %error, "AMT worker shutdown during app exit failed");
+            }
+        }
     }
 
     pub fn midi_bytes(&self, track_id: &str) -> Result<Vec<u8>, AmtError> {
@@ -356,4 +384,11 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), AmtError> {
     out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     fs::rename(temp, path)?;
     Ok(())
+}
+fn cleanup_temporary_job(path: &Path) {
+    if let Err(error) = fs::remove_dir_all(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(error = %error, job_path = %path.display(), "could not remove leftover AMT temporary output");
+        }
+    }
 }
