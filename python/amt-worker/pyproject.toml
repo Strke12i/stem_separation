@@ -1,0 +1,46 @@
+[project]
+name = "music-analyzer-amt-worker"
+version = "0.1.0"
+description = "Isolated Basic Pitch sidecar for Local Music Analyzer"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "basic-pitch==0.4.0",
+  "onnxruntime>=1.17,<2",
+  "setuptools>=68,<81",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.18,<2",
+  "pytest>=8.4,<9",
+  "ruff>=0.12,<1",
+]
+package = [
+  "pyinstaller>=6.12,<7",
+]
+
+[project.scripts]
+music-analyzer-amt-worker = "music_analyzer_amt.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.8,<0.9"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "music_analyzer_amt"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
