@@ -15,9 +15,15 @@
   type PitchReport = { stem: string; engine: string; notes: unknown[]; cacheHit: boolean };
   type MidiNote = { start: number; end: number; midi: number; velocity: number };
   type AmtReport = { engine: string; model: string; notes: MidiNote[]; midiArtifact: string; cacheHit: boolean };
-  type Tab = 'workspace' | 'separation' | 'transcription' | 'analysis' | 'mixer';
+  type LibraryEntry = { trackId: string; originalName: string; durationSeconds: number; sampleRate: number; channels: number; sourceSha256: string; bpm: number | null; keyLabel: string | null; stemModels: string[]; analyzed: string[]; importedAt: string | null; lastOpenedAt: string | null; openCount: number; tags: string[] };
+  type LibraryTag = { tag: string; trackCount: number };
+  type LibrarySort = 'recent' | 'name';
+  type LibraryQuery = { text: string; tags: string[]; sort: LibrarySort };
+  type LibrarySyncReport = { indexed: number; updated: number; removed: number; rebuilt: boolean };
+  type Tab = 'library' | 'workspace' | 'separation' | 'transcription' | 'analysis' | 'mixer';
 
   const tabs: { id: Tab; label: string; icon: string }[] = [
+    { id: 'library', label: 'Library', icon: '▤' },
     { id: 'workspace', label: 'Workspace', icon: '◫' }, { id: 'separation', label: 'Stems', icon: '✦' },
     { id: 'transcription', label: 'MIDI', icon: '♫' }, { id: 'analysis', label: 'Analysis', icon: '⌁' }, { id: 'mixer', label: 'Mixer', icon: '≋' }
   ];
@@ -66,6 +72,15 @@
   let midiTimer: ReturnType<typeof window.setTimeout> | undefined;
   let midiContext: AudioContext | undefined;
   let oscillators: OscillatorNode[] = [];
+  let libraryEntries: LibraryEntry[] = [];
+  let libraryTags: LibraryTag[] = [];
+  let librarySearchText = '';
+  let librarySelectedTags: string[] = [];
+  let librarySort: LibrarySort = 'recent';
+  let libraryError: string | undefined;
+  let libraryBusy = false;
+  let libraryTimer: ReturnType<typeof window.setTimeout> | undefined;
+  let libraryTagDraft: Record<string, string> = {};
 
   onMount(() => {
     void runDoctor(); void loadModels();
@@ -75,7 +90,7 @@
         if (separating !== undefined || separationStatus !== undefined) void refreshSeparation();
       }
     }, 350);
-    return () => { window.clearInterval(timer); if (volumeTimer) window.clearTimeout(volumeTimer); stopMidiPreview(); };
+    return () => { window.clearInterval(timer); if (volumeTimer) window.clearTimeout(volumeTimer); if (libraryTimer) window.clearTimeout(libraryTimer); stopMidiPreview(); };
   });
 
   async function runDoctor(restart = false): Promise<void> {
@@ -85,24 +100,74 @@
     finally { checking = false; }
   }
   async function loadModels(): Promise<void> { try { models = await invoke<SeparationModel[]>('separation_models'); } catch (error) { separationError = String(error); } }
-  function selectTab(tab: Tab): void { activeTab = tab; void tick().then(drawWaveform); }
+  function selectTab(tab: Tab): void { activeTab = tab; if (tab === 'library') void refreshLibrary(); void tick().then(drawWaveform); }
   async function refreshAudio(): Promise<void> { try { audio = await invoke<AudioState>('audio_state'); audioError = undefined; } catch (error) { audioError = String(error); } }
   async function refreshSeparation(): Promise<void> {
     if (!track) return;
     try { const value = await invoke<SeparationStatus | null>('separation_status', { trackId: track.trackId }); if (value !== null) separationStatus = value; else if (!separating) separationStatus = undefined; } catch { /* do not interrupt a long-running job */ }
   }
+  async function adoptTrack(next: Track): Promise<void> {
+    stopMidiPreview(); track = next; activeTab = 'workspace'; midiWindowStart = 0; rhythm = undefined; harmony = undefined; pitch = {}; amt = undefined;
+    separationResult = undefined; separating = undefined; separationStatus = undefined; separationError = undefined;
+    await loadOriginal(next.trackId);
+    await Promise.all([loadCachedRhythm(next.trackId), loadCachedHarmony(next.trackId), loadCachedPitch(next.trackId, 'bass'), loadCachedPitch(next.trackId, 'vocals'), loadCachedAmt(next.trackId)]);
+  }
   async function importTrack(): Promise<void> {
     importing = true; importError = undefined;
     try {
       const result = await invoke<Track | null>('pick_and_import');
-      if (result) {
-        stopMidiPreview(); track = result; activeTab = 'workspace'; midiWindowStart = 0; rhythm = undefined; harmony = undefined; pitch = {}; amt = undefined;
-        separationResult = undefined; separating = undefined; separationStatus = undefined; separationError = undefined;
-        await loadOriginal(result.trackId);
-        await Promise.all([loadCachedRhythm(result.trackId), loadCachedHarmony(result.trackId), loadCachedPitch(result.trackId, 'bass'), loadCachedPitch(result.trackId, 'vocals'), loadCachedAmt(result.trackId)]);
-      }
+      if (result) { await adoptTrack(result); void refreshLibrary(); }
     } catch (error) { importError = String(error); }
     finally { importing = false; }
+  }
+  async function openFromLibrary(entry: LibraryEntry): Promise<void> {
+    try {
+      const opened = await invoke<LibraryEntry>('library_open_track', { trackId: entry.trackId });
+      await adoptTrack({ trackId: opened.trackId, originalName: opened.originalName, durationSeconds: opened.durationSeconds, sampleRate: opened.sampleRate, channels: opened.channels });
+      void refreshLibrary();
+    } catch (error) { libraryError = String(error); }
+  }
+  async function refreshLibrary(): Promise<void> {
+    libraryBusy = true; libraryError = undefined;
+    try {
+      const [entries, tags] = await Promise.all([invoke<LibraryEntry[]>('library_list'), invoke<LibraryTag[]>('library_tags')]);
+      libraryEntries = entries; libraryTags = tags;
+    } catch (error) { libraryError = String(error); }
+    finally { libraryBusy = false; }
+  }
+  async function runLibrarySearch(): Promise<void> {
+    try {
+      const query: LibraryQuery = { text: librarySearchText, tags: librarySelectedTags, sort: librarySort };
+      libraryEntries = await invoke<LibraryEntry[]>('library_search', { query });
+    } catch (error) { libraryError = String(error); }
+  }
+  function scheduleLibrarySearch(): void { if (libraryTimer) window.clearTimeout(libraryTimer); libraryTimer = window.setTimeout(() => void runLibrarySearch(), 120); }
+  function toggleTagFilter(tag: string): void {
+    librarySelectedTags = librarySelectedTags.includes(tag) ? librarySelectedTags.filter((item) => item !== tag) : [...librarySelectedTags, tag];
+    void runLibrarySearch();
+  }
+  async function addTag(entry: LibraryEntry): Promise<void> {
+    const tag = (libraryTagDraft[entry.trackId] ?? '').trim();
+    if (!tag) return;
+    try {
+      const updated = await invoke<LibraryEntry>('library_add_tag', { trackId: entry.trackId, tag });
+      libraryEntries = libraryEntries.map((item) => (item.trackId === updated.trackId ? updated : item));
+      libraryTagDraft = { ...libraryTagDraft, [entry.trackId]: '' };
+      libraryTags = await invoke<LibraryTag[]>('library_tags');
+    } catch (error) { libraryError = String(error); }
+  }
+  async function removeTag(entry: LibraryEntry, tag: string): Promise<void> {
+    try {
+      const updated = await invoke<LibraryEntry>('library_remove_tag', { trackId: entry.trackId, tag });
+      libraryEntries = libraryEntries.map((item) => (item.trackId === updated.trackId ? updated : item));
+      libraryTags = await invoke<LibraryTag[]>('library_tags');
+    } catch (error) { libraryError = String(error); }
+  }
+  async function rebuildLibrary(): Promise<void> {
+    libraryBusy = true; libraryError = undefined;
+    try { await invoke<LibrarySyncReport>('library_rebuild'); await refreshLibrary(); }
+    catch (error) { libraryError = String(error); }
+    finally { libraryBusy = false; }
   }
   async function loadOriginal(trackId: string): Promise<void> { try { audio = await invoke<AudioState>('load_original_track', { trackId }); audioError = undefined; await tick(); drawWaveform(); } catch (error) { audioError = String(error); } }
   async function loadStemMix(modelId: string): Promise<void> { if (!track) return; try { audio = await invoke<AudioState>('load_stem_mix', { trackId: track.trackId, modelId }); audioError = undefined; selectTab('mixer'); await tick(); drawWaveform(); } catch (error) { audioError = String(error); } }
@@ -174,12 +239,53 @@
   <header class="app-header"><div class="brand"><b>≋</b><div><p class="eyebrow">LOCAL STEM WORKBENCH</p><h1>Local Music Analyzer</h1></div></div><button class="diagnostic" type="button" disabled={checking} onclick={() => runDoctor(true)}><span class:good={report?.analysisWorker.ok} class:bad={report !== undefined && !report.analysisWorker.ok}>●</span>{checking ? 'Checking engine' : report?.analysisWorker.ok ? 'Engine ready' : 'Check engine'}</button></header>
   {#if report !== undefined && !report.analysisWorker.ok}<p class="error compact">{report.analysisWorker.detail}</p>{/if}
 
-  {#if track === undefined}
-    <section class="welcome"><p class="eyebrow">START A SESSION</p><h2>Bring a song into the workbench.</h2><p>Analyze rhythm and harmony, generate local stems, create a MIDI sketch, and audition results without uploading audio.</p><button class="primary large" type="button" disabled={importing} onclick={importTrack}>{importing ? 'Importing audio…' : 'Open audio file'}</button><small>MP3 · WAV · FLAC · M4A · AAC · OGG · OPUS</small>{#if importError}<p class="error">{importError}</p>{/if}</section>
-  {:else}
+  {#if track !== undefined}
     <section class="track-strip"><div class="track-art">♫</div><div class="track-meta"><p class="eyebrow">CURRENT SOURCE</p><h2>{track.originalName}</h2><p>{formatTime(track.durationSeconds)} · {track.sampleRate / 1000} kHz · {track.channels === 1 ? 'Mono' : 'Stereo'}</p></div><button class="secondary" type="button" disabled={importing} onclick={importTrack}>{importing ? 'Importing…' : 'Replace track'}</button></section>
-    <nav class="tabs" aria-label="Workbench sections">{#each tabs as tab}<button type="button" role="tab" aria-selected={activeTab === tab.id} class:active={activeTab === tab.id} onclick={() => selectTab(tab.id)}><span>{tab.icon}</span>{tab.label}</button>{/each}</nav>
+  {/if}
+  {#if track !== undefined || activeTab === 'library'}
+    <nav class="tabs" aria-label="Workbench sections">{#each tabs as tab}<button type="button" role="tab" aria-selected={activeTab === tab.id} disabled={track === undefined && tab.id !== 'library'} class:active={activeTab === tab.id} onclick={() => selectTab(tab.id)}><span>{tab.icon}</span>{tab.label}</button>{/each}</nav>
+  {/if}
 
+  {#if activeTab === 'library'}
+    <section class="panel library">
+      <div class="heading"><div><p class="eyebrow">LIBRARY</p><h2>{libraryEntries.length} tracks indexed</h2></div><em>LOCAL INDEX</em></div>
+      <div class="actions">
+        <button class="primary" type="button" disabled={importing} onclick={importTrack}>{importing ? 'Importing…' : 'Import new track'}</button>
+        <button class="ghost" type="button" disabled={libraryBusy} onclick={rebuildLibrary}>{libraryBusy ? 'Rebuilding…' : 'Rebuild index'}</button>
+      </div>
+      <div class="library-toolbar">
+        <input type="search" placeholder="Search name, key or tag…" bind:value={librarySearchText} oninput={scheduleLibrarySearch} />
+        <select bind:value={librarySort} onchange={runLibrarySearch}>
+          <option value="recent">Recent</option>
+          <option value="name">Name</option>
+        </select>
+      </div>
+      {#if libraryTags.length > 0}
+        <div class="actions">{#each libraryTags as tagEntry (tagEntry.tag)}<button class="chip" class:active={librarySelectedTags.includes(tagEntry.tag)} type="button" onclick={() => toggleTagFilter(tagEntry.tag)}>{tagEntry.tag} <b>{tagEntry.trackCount}</b></button>{/each}</div>
+      {/if}
+      {#if libraryEntries.length === 0}
+        <div class="empty"><span>▤</span><h3>No tracks indexed yet</h3><p>Import a track to start building your library.</p><button class="primary" type="button" disabled={importing} onclick={importTrack}>Import audio</button></div>
+      {:else}
+        <div class="library-list">
+          {#each libraryEntries as entry (entry.trackId)}
+            <article>
+              <div class="heading"><strong>{entry.originalName}</strong><small>{formatTime(entry.durationSeconds)}{entry.bpm !== null ? ` · ${entry.bpm.toFixed(1)} BPM` : ''}{entry.keyLabel !== null ? ` · ${entry.keyLabel}` : ''}</small></div>
+              <p class="detail">{entry.stemModels.length > 0 ? `Stems: ${entry.stemModels.join(', ')}` : 'No stems yet'}{entry.analyzed.length > 0 ? ` · Analyzed: ${entry.analyzed.join(', ')}` : ''}</p>
+              <small>Opened {entry.openCount}× · {entry.lastOpenedAt ?? 'never'}</small>
+              <div class="actions">
+                {#each entry.tags as tag}<span class="chip">{tag} <button type="button" aria-label={`Remove tag ${tag}`} onclick={() => removeTag(entry, tag)}>×</button></span>{/each}
+                <input type="text" placeholder="Add tag" value={libraryTagDraft[entry.trackId] ?? ''} oninput={(event) => { libraryTagDraft = { ...libraryTagDraft, [entry.trackId]: event.currentTarget.value }; }} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void addTag(entry); } }} />
+              </div>
+              <button class="primary" type="button" onclick={() => openFromLibrary(entry)}>Open</button>
+            </article>
+          {/each}
+        </div>
+      {/if}
+      {#if libraryError}<p class="error">{libraryError}</p>{/if}
+    </section>
+  {:else if track === undefined}
+    <section class="welcome"><p class="eyebrow">START A SESSION</p><h2>Bring a song into the workbench.</h2><p>Analyze rhythm and harmony, generate local stems, create a MIDI sketch, and audition results without uploading audio.</p><button class="primary large" type="button" disabled={importing} onclick={importTrack}>{importing ? 'Importing audio…' : 'Open audio file'}</button><button class="ghost" type="button" onclick={() => selectTab('library')}>Browse library</button><small>MP3 · WAV · FLAC · M4A · AAC · OGG · OPUS</small>{#if importError}<p class="error">{importError}</p>{/if}</section>
+  {:else}
     {#if activeTab === 'workspace'}
       <section class="panel"><div class="heading"><div><p class="eyebrow">SOURCE TRANSPORT</p><h2>{audio?.stemMix ? 'Stem mix loaded' : 'Original track'}</h2></div><em>{audio?.status ?? 'loading'}</em></div>{#if audio && audio.status !== 'empty'}<canvas bind:this={waveformCanvas} width="900" height="150" aria-label="Waveform overview"></canvas><div class="readout"><strong>{formatTime(audio.currentPositionSeconds)}</strong><span>/ {formatTime(audio.durationSeconds)}</span></div><input type="range" min="0" max={audio.durationSeconds} step="0.01" value={seeking ? seekValue : audio.currentPositionSeconds} oninput={(event) => { seeking = true; seekValue = Number(event.currentTarget.value); }} onchange={(event) => { seeking = false; void audioCommand('seek_audio', { seconds: Number(event.currentTarget.value) }); }} /><div class="actions"><button class="primary" type="button" onclick={() => audioCommand('play_audio')}>▶ Play</button><button class="secondary" type="button" onclick={() => audioCommand('pause_audio')}>Pause</button><button class="secondary" type="button" onclick={() => audioCommand('stop_audio')}>Stop</button><button class="ghost" type="button" onclick={() => audioCommand('reopen_audio_device')}>Reconnect output</button></div><label class="slider-label">Master output<input type="range" min="0" max="2" step="0.01" value={audio.volume} oninput={(event) => scheduleVolume('set_master_volume', { volume: Number(event.currentTarget.value) })} /></label>{/if}{#if audioError}<p class="error">{audioError}</p>{/if}</section>
       <section class="quick-grid"><button type="button" onclick={() => selectTab('separation')}><span>✦</span><strong>Generate stems</strong><small>Demucs locally</small></button><button type="button" onclick={() => selectTab('transcription')}><span>♫</span><strong>Make MIDI sketch</strong><small>Basic Pitch</small></button><button type="button" onclick={() => selectTab('analysis')}><span>⌁</span><strong>Analyze song</strong><small>BPM, key, chords</small></button></section>
