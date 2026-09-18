@@ -13,9 +13,11 @@
     "windows": [
       {
         "title": "Local Music Analyzer",
-        "width": 640,
-        "height": 420,
-        "resizable": false
+        "width": 800,
+        "height": 820,
+        "minWidth": 560,
+        "minHeight": 560,
+        "resizable": true
       }
     ],
     "security": {
@@ -24,7 +26,6 @@
   },
   "bundle": {
     "active": false,
-    "targets": "all",
     "icon": ["icons/icon.png"]
   }
 }

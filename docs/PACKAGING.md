@@ -53,12 +53,12 @@ Modelos podem ser instalados separadamente.
 
 Estratégia inicial a avaliar:
 
-### PyInstaller onedir
+### PyInstaller onefile
 
 Vantagens:
 
 - amplamente usado;
-- Tauri documenta sidecars Python;
+- artefato compatível com `externalBin` do Tauri;
 - não exige Python do usuário.
 
 Desvantagens:
@@ -67,9 +67,12 @@ Desvantagens:
 - PyTorch/TensorFlow complicam size;
 - builds por plataforma/arquitetura.
 
-Preferir `onedir` inicialmente para debuggability.
-
-Não prometer single executable.
+O primeiro pipeline usa `onefile`: o `externalBin` do Tauri inclui um binário
+por sidecar e, assim, não deixa dependências Python ao lado de fora do
+instalador. O custo é uma inicialização um pouco maior, pois o PyInstaller
+extrai o runtime em diretório temporário. Se esse custo se tornar relevante,
+uma futura revisão poderá usar `onedir` como recurso completo do bundle, e não
+somente copiar seu `.exe`.
 
 ## Tauri externalBin
 
@@ -84,6 +87,32 @@ analysis-worker-x86_64-unknown-linux-gnu
 ```
 
 Build pipeline gera artefatos por plataforma.
+
+`tauri.conf.json` mantém o bundle desativado para que `cargo check`, testes e
+`tauri dev` não exijam binários de release. O arquivo
+`tauri.release.conf.json`, aplicado apenas por `package-desktop.ps1`, ativa o
+bundle e declara os dois `externalBin`.
+
+### ImplementaÃ§Ã£o da Fase 11
+
+`scripts/build-sidecars.ps1` produz executáveis Windows com sufixo do target em
+`apps/desktop/src-tauri/binaries/`, usando o ambiente bloqueado de cada worker
+e PyInstaller `onefile`. Passe `-Amt` para incluir o worker AMT opcional e
+`-FfmpegDirectory <diretório-bin>` para copiar `ffmpeg.exe` e `ffprobe.exe`
+explicitamente para o bundle.
+`scripts/smoke-package.ps1` validates both sidecar handshakes and requires
+`ffmpeg.exe` plus `ffprobe.exe` in the same directory before a desktop bundle.
+Models remain outside the installer and are installed explicitly.
+
+Para gerar o instalador Windows completo, execute:
+
+```powershell
+.\scripts\package-desktop.ps1 -FfmpegDirectory "C:\caminho\para\ffmpeg\bin"
+```
+
+O fluxo de release inclui ambos os workers que `externalBin` declara. Nenhuma
+etapa baixa modelos: eles são instalados e verificados pelo Model Manager depois
+da instalação do app.
 
 ## FFmpeg
 
