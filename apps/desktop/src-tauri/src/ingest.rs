@@ -351,6 +351,11 @@ impl IngestService {
         self.workspace_root.join("models")
     }
 
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn import_to_staging(
         &self,

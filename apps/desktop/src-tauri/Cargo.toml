@@ -15,6 +15,7 @@ analyzer-audio = { path = "../../../crates/analyzer-audio" }
 analyzer-protocol = { path = "../../../crates/analyzer-protocol" }
 serde.workspace = true
 serde_json.workspace = true
+rusqlite.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true

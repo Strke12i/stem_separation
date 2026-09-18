@@ -3,6 +3,7 @@ pub mod audio;
 pub mod doctor;
 pub mod harmony;
 pub mod ingest;
+pub mod library;
 pub mod pitch;
 pub mod rhythm;
 pub mod scheduler;
