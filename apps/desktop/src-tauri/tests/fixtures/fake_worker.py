@@ -59,6 +59,17 @@ def respond_rhythm(request: dict[str, object]) -> None:
     emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"bpm": 120.0, "beat_times": [0.5, 1.0, 1.5, 2.0], "algorithm": "librosa.beat", "stability_score": 1.0}})
 
 
+def respond_amt(request: dict[str, object]) -> None:
+    params = request["params"]
+    if not isinstance(params, dict):
+        return
+    output = Path(str(params["output_dir"]))
+    output.mkdir(parents=True)
+    (output / "transcription.mid").write_bytes(b"MThd" + b"\x00" * 10)
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "event", "job_id": request["job_id"], "event": "progress", "data": {"stage": "writing_midi", "percent": 0.85}})
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"engine": "basic-pitch", "model": "icassp_2022", "relative_midi_path": "transcription.mid", "notes": [{"start": 0.0, "end": 1.0, "midi": 60, "velocity": 90}]}})
+
+
 def respond_pitch(request: dict[str, object]) -> None:
     params = request["params"]
     stem = params.get("stem") if isinstance(params, dict) else "bass"
@@ -101,6 +112,8 @@ def main() -> None:
             respond_rhythm(request)
         elif mode == "pitch" and request.get("method") == "analyze_pitch":
             respond_pitch(request)
+        elif mode == "amt" and request.get("method") == "transcribe":
+            respond_amt(request)
         else:
             respond(request)
 

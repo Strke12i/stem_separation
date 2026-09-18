@@ -611,6 +611,9 @@ fn copy_file_atomically(source: &Path, destination: &Path) -> Result<(), IngestE
     let parent = destination.parent().ok_or(IngestError::InvalidSource)?;
     fs::create_dir_all(parent).map_err(workspace_error("create source directory"))?;
     let temporary = destination.with_extension("copying");
+    // A prior crash between create and rename can leave this file behind;
+    // remove it so a retried import is not permanently blocked by AlreadyExists.
+    let _ = fs::remove_file(&temporary);
     let source_file = File::open(source).map_err(IngestError::ReadSource)?;
     let destination_file = OpenOptions::new()
         .create_new(true)
@@ -637,6 +640,9 @@ fn copy_file_atomically(source: &Path, destination: &Path) -> Result<(), IngestE
 fn write_json_atomically(path: &Path, manifest: &TrackManifest) -> Result<(), IngestError> {
     let serialized = serde_json::to_vec_pretty(manifest).map_err(IngestError::SerializeManifest)?;
     let temporary = path.with_extension("json.tmp");
+    // A prior crash between create and rename can leave this file behind;
+    // remove it so this write is not permanently blocked by AlreadyExists.
+    let _ = fs::remove_file(&temporary);
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)

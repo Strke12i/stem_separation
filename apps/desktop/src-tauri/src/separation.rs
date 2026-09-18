@@ -245,6 +245,7 @@ impl SeparationService {
             Ok(result) => result,
             Err(error) => {
                 self.clear_active(&job_id).await;
+                cleanup_temporary_job(&temp_dir);
                 return Err(SeparationError::Worker(error.to_string()));
             }
         };
@@ -252,12 +253,22 @@ impl SeparationService {
             .await;
         if let Err(error) = validate_worker_result(&result, &temp_dir, descriptor) {
             self.clear_active(&job_id).await;
+            cleanup_temporary_job(&temp_dir);
             return Err(error);
+        }
+        // Re-check right before promotion: the worker call and validation above
+        // both take time, and a cancel arriving in that window must still stop
+        // artifacts from being published.
+        if self.cancellation_requested(&job_id).await {
+            self.clear_active(&job_id).await;
+            cleanup_temporary_job(&temp_dir);
+            return Err(SeparationError::Cancelled);
         }
         self.update_active(&job_id, "Publishing stems to workspace", 0.97)
             .await;
         if let Err(error) = promote(&temp_dir, &final_dir, &cache_key, descriptor) {
             self.clear_active(&job_id).await;
+            cleanup_temporary_job(&temp_dir);
             return Err(error);
         }
         if let Err(error) = persist_artifacts(&workspace, manifest, descriptor, &cache_key) {
@@ -539,8 +550,35 @@ fn promote(
     }
     fs::rename(temporary, &staging)?;
     let marker = json!({"cache_key": cache_key, "engine": "audio-separator", "model_id": descriptor.id, "stems": descriptor.stems.iter().map(StemKind::name).collect::<Vec<_>>()});
-    write_json(&staging.join("separation.json"), &marker)?;
-    fs::rename(staging, final_dir)?;
+    if let Err(error) = write_json(&staging.join("separation.json"), &marker) {
+        cleanup_temporary_job(&staging);
+        return Err(error);
+    }
+    // Reaching here means `cached_stems_are_valid` already judged any existing
+    // final_dir invalid (missing/corrupt stems), so it must be replaced. Plain
+    // `fs::rename` cannot replace an existing non-empty directory on Windows,
+    // so the stale copy is relocated first and only removed once the new
+    // stems are safely in place; on failure it is restored so a promotion
+    // error never leaves the cache slot empty when a valid copy existed.
+    if final_dir.exists() {
+        let doomed = parent.join(format!(".{}-doomed", cache_key));
+        if doomed.exists() {
+            fs::remove_dir_all(&doomed)?;
+        }
+        if let Err(error) = fs::rename(final_dir, &doomed) {
+            cleanup_temporary_job(&staging);
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&staging, final_dir) {
+            let _ = fs::rename(&doomed, final_dir);
+            cleanup_temporary_job(&staging);
+            return Err(error.into());
+        }
+        cleanup_temporary_job(&doomed);
+    } else if let Err(error) = fs::rename(&staging, final_dir) {
+        cleanup_temporary_job(&staging);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -601,6 +639,9 @@ fn file_hash(path: &Path) -> Result<String, SeparationError> {
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), SeparationError> {
     let bytes = serde_json::to_vec_pretty(value)?;
     let temporary = path.with_extension("json.tmp");
+    // A prior crash between create and rename can leave this file behind;
+    // remove it so this write is not permanently blocked by AlreadyExists.
+    let _ = fs::remove_file(&temporary);
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -620,7 +661,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), SeparationError
 fn cleanup_temporary_job(path: &Path) {
     if let Err(error) = fs::remove_dir_all(path) {
         if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(error = %error, job_path = %path.display(), "could not remove cancelled separation temporary output");
+            tracing::warn!(error = %error, job_path = %path.display(), "could not remove leftover separation temporary output");
         }
     }
 }

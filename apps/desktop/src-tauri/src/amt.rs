@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 
 const ENGINE: &str = "basic-pitch";
 const VERSION: &str = "0.4.0";
+const MAX_AUTOMATIC_RESTARTS: u8 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +52,8 @@ pub struct AmtService {
     worker: Mutex<Option<WorkerSupervisor>>,
     execution: Mutex<()>,
     scheduler: Arc<ResourceScheduler>,
+    restart_failures: Mutex<u8>,
+    launch: WorkerLaunch,
 }
 #[derive(Debug, Error)]
 pub enum AmtError {
@@ -74,11 +77,22 @@ pub enum AmtError {
 impl AmtService {
     #[must_use]
     pub fn development(ingest: Arc<IngestService>, scheduler: Arc<ResourceScheduler>) -> Self {
+        Self::new(ingest, scheduler, amt_launch())
+    }
+
+    #[must_use]
+    pub fn new(
+        ingest: Arc<IngestService>,
+        scheduler: Arc<ResourceScheduler>,
+        launch: WorkerLaunch,
+    ) -> Self {
         Self {
             ingest,
             worker: Mutex::new(None),
             execution: Mutex::new(()),
             scheduler,
+            restart_failures: Mutex::new(0),
+            launch,
         }
     }
     pub async fn transcribe(&self, track_id: String) -> Result<AmtReport, AmtError> {
@@ -175,25 +189,47 @@ impl AmtService {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, AmtError> {
         let mut worker = self.worker.lock().await;
-        if worker.is_none() {
-            *worker = Some(
-                WorkerSupervisor::start(amt_launch())
-                    .await
-                    .map_err(map_start)?,
-            );
+        if worker.is_none() && *self.restart_failures.lock().await >= MAX_AUTOMATIC_RESTARTS {
+            return Err(AmtError::WorkerUnavailable);
         }
-        let active = worker.as_mut().ok_or(AmtError::WorkerUnavailable)?;
-        active
+        if worker.is_none() {
+            match WorkerSupervisor::start(self.launch.clone()).await {
+                Ok(started) => *worker = Some(started),
+                Err(error) => {
+                    *self.restart_failures.lock().await += 1;
+                    return Err(map_start(error));
+                }
+            }
+        }
+        if let Err(error) = worker
+            .as_mut()
+            .ok_or(AmtError::WorkerUnavailable)?
             .ping()
             .await
-            .map_err(|e| AmtError::Worker(e.to_string()))?;
-        active
+        {
+            // A dead or desynchronized worker must not be reused: stdout framing
+            // is unknown. Dropping kills the child (kill_on_drop) so the next
+            // request starts a clean process, mirroring WorkerManager's handling.
+            *worker = None;
+            *self.restart_failures.lock().await += 1;
+            return Err(AmtError::Worker(error.to_string()));
+        }
+        let result = worker
+            .as_mut()
+            .ok_or(AmtError::WorkerUnavailable)?
             .request_with_job(Method::Transcribe, job, params)
-            .await
-            .map_err(|e| AmtError::Worker(e.to_string()))?
-            .0
-            .result
-            .ok_or(AmtError::InvalidResult)
+            .await;
+        match result {
+            Ok((response, _events)) => {
+                *self.restart_failures.lock().await = 0;
+                response.result.ok_or(AmtError::InvalidResult)
+            }
+            Err(error) => {
+                *worker = None;
+                *self.restart_failures.lock().await += 1;
+                Err(AmtError::Worker(error.to_string()))
+            }
+        }
     }
 }
 fn map_start(error: SupervisorError) -> AmtError {
@@ -306,6 +342,9 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), AmtError> {
     let parent = path.parent().ok_or(AmtError::InvalidResult)?;
     fs::create_dir_all(parent)?;
     let temp = path.with_extension("json.tmp");
+    // A prior crash between create and rename can leave this file behind;
+    // remove it so this write is not permanently blocked by AlreadyExists.
+    let _ = fs::remove_file(&temp);
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)

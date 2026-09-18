@@ -213,6 +213,9 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), RhythmError> {
     let parent = path.parent().ok_or(RhythmError::InvalidResult)?;
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension("json.tmp");
+    // A prior crash between create and rename can leave this file behind;
+    // remove it so this write is not permanently blocked by AlreadyExists.
+    let _ = fs::remove_file(&temporary);
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
