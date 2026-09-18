@@ -3,18 +3,21 @@
 //! The database at `<workspace_root>/library/index.sqlite3` is a disposable
 //! derived cache: everything it stores can be recomputed by rescanning each
 //! track's `manifest.json` (plus a small per-track `library.json` sidecar for
-//! library-only facts like tags and open history, added in a later phase).
-//! Deleting the database file must never lose data; a corrupt or
-//! schema-mismatched file is simply recreated empty and repopulated on the
-//! next scan.
+//! library-only facts: tags and open history). Deleting the database file
+//! must never lose data; a corrupt or schema-mismatched file is simply
+//! recreated empty and repopulated on the next scan. Tags and open history
+//! are not stored in the database at all for exactly this reason - they
+//! live in the sidecar, and the database only mirrors them for fast
+//! search/listing.
 
 use crate::ingest::IngestService;
 use analyzer_domain::{ArtifactKind, TrackManifest};
-use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use rusqlite::{Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::UNIX_EPOCH;
@@ -45,8 +48,14 @@ pub struct LibraryEntry {
     pub imported_at: Option<String>,
     pub last_opened_at: Option<String>,
     pub open_count: u32,
-    // Populated starting with the tagging phase; always empty until then.
     pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryTag {
+    pub tag: String,
+    pub track_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -60,6 +69,10 @@ pub struct LibrarySyncReport {
 
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    #[error("The requested imported track is unavailable.")]
+    UnknownTrack,
+    #[error("A tag must have 1 to 32 visible characters.")]
+    InvalidTag,
     #[error("Could not read or write library files: {0}")]
     Storage(#[from] std::io::Error),
     #[error("Could not access the library index: {0}")]
@@ -68,6 +81,35 @@ pub enum LibraryError {
     Manifest(#[from] serde_json::Error),
     #[error("Could not obtain a timestamp: {0}")]
     Clock(#[from] time::error::Format),
+}
+
+/// The library-only facts that do not exist in any manifest, kept beside it
+/// so the SQLite index above can be deleted at any time without losing them.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LibrarySidecar {
+    #[serde(default = "sidecar_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    last_opened_at: Option<String>,
+    #[serde(default)]
+    open_count: u32,
+}
+
+impl Default for LibrarySidecar {
+    fn default() -> Self {
+        Self {
+            schema_version: sidecar_schema_version(),
+            tags: Vec::new(),
+            last_opened_at: None,
+            open_count: 0,
+        }
+    }
+}
+
+fn sidecar_schema_version() -> u32 {
+    1
 }
 
 impl LibraryService {
@@ -160,14 +202,86 @@ impl LibraryService {
             metadata.len() as i64,
             &now,
         )?;
-        connection
-            .query_row(
-                &format!("{ENTRY_COLUMNS} FROM tracks WHERE track_id = ?1"),
-                [track_id],
-                row_to_entry,
-            )
-            .optional()
+        read_entry(&connection, track_id)
+    }
+
+    /// Adds a tag to a track (normalized: trimmed, lowercased, whitespace
+    /// collapsed; a no-op if already present).
+    pub fn tag(&self, track_id: &str, tag: &str) -> Result<LibraryEntry, LibraryError> {
+        let normalized = normalize_tag(tag)?;
+        self.edit_sidecar(track_id, |sidecar| {
+            if !sidecar.tags.iter().any(|existing| existing == &normalized) {
+                sidecar.tags.push(normalized.clone());
+                sidecar.tags.sort_unstable();
+            }
+        })
+    }
+
+    /// Removes a tag from a track; a no-op if it was not present.
+    pub fn untag(&self, track_id: &str, tag: &str) -> Result<LibraryEntry, LibraryError> {
+        let normalized = normalize_tag(tag)?;
+        self.edit_sidecar(track_id, |sidecar| {
+            sidecar.tags.retain(|existing| existing != &normalized);
+        })
+    }
+
+    /// Records that a track was just opened: bumps its open count and sets
+    /// its last-opened timestamp to now.
+    pub fn touch_opened(&self, track_id: &str) -> Result<LibraryEntry, LibraryError> {
+        let now = now_rfc3339()?;
+        self.edit_sidecar(track_id, |sidecar| {
+            sidecar.open_count = sidecar.open_count.saturating_add(1);
+            sidecar.last_opened_at = Some(now.clone());
+        })
+    }
+
+    /// Every tag currently in use, with how many tracks carry it.
+    pub fn tags(&self) -> Result<Vec<LibraryTag>, LibraryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut statement = connection
+            .prepare("SELECT tag, COUNT(*) FROM track_tags GROUP BY tag ORDER BY tag ASC")?;
+        let rows = statement.query_map([], |row| {
+            let track_count: i64 = row.get(1)?;
+            Ok(LibraryTag {
+                tag: row.get(0)?,
+                track_count: track_count as u32,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(LibraryError::from)
+    }
+
+    /// Reads a track's sidecar, applies `edit`, writes it back, mirrors the
+    /// change into the database, and returns the resulting entry. `refresh`
+    /// first so the track's row is guaranteed to exist (a fresh import may
+    /// not have been indexed yet) and so manifest-derived fields are current.
+    fn edit_sidecar(
+        &self,
+        track_id: &str,
+        edit: impl FnOnce(&mut LibrarySidecar),
+    ) -> Result<LibraryEntry, LibraryError> {
+        let workspace = self
+            .ingest
+            .workspace_for(track_id)
+            .map_err(|_| LibraryError::UnknownTrack)?;
+        if self.refresh(track_id)?.is_none() {
+            return Err(LibraryError::UnknownTrack);
+        }
+        let mut sidecar = read_sidecar(&workspace);
+        edit(&mut sidecar);
+        write_sidecar(&workspace, &sidecar)?;
+
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let transaction = connection.transaction()?;
+        sync_sidecar_columns(&transaction, track_id, &sidecar)?;
+        transaction.commit()?;
+        read_entry(&connection, track_id)?.ok_or(LibraryError::UnknownTrack)
     }
 
     /// Reconciles the index, then returns every indexed track, most
@@ -182,9 +296,13 @@ impl LibraryService {
             "{ENTRY_COLUMNS} FROM tracks \
              ORDER BY last_opened_at IS NULL, last_opened_at DESC, imported_at DESC, original_name_folded ASC"
         ))?;
-        let rows = statement.query_map([], row_to_entry)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(LibraryError::from)
+        let mut entries = statement
+            .query_map([], row_to_entry)?
+            .collect::<Result<Vec<_>, _>>()?;
+        for entry in &mut entries {
+            entry.tags = read_tags_for(&connection, &entry.track_id)?;
+        }
+        Ok(entries)
     }
 
     fn scan(&self, force: bool) -> Result<LibrarySyncReport, LibraryError> {
@@ -222,7 +340,12 @@ impl LibraryService {
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
+                // Cheap regardless of the staleness gate below: the sidecar
+                // is a small file, and library-only columns (tags, open
+                // history) are not covered by the manifest mtime/size check.
+                let sidecar = read_sidecar(&entry.path());
                 if !force && current == Some((modified_unix, size_bytes)) {
+                    sync_sidecar_columns(&transaction, name, &sidecar)?;
                     continue;
                 }
                 let Ok(bytes) = fs::read(&manifest_path) else {
@@ -244,6 +367,7 @@ impl LibraryService {
                     size_bytes,
                     &now,
                 )?;
+                sync_sidecar_columns(&transaction, name, &sidecar)?;
                 if current.is_some() {
                     updated += 1;
                 } else {
@@ -300,6 +424,98 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<LibraryEntry> {
         open_count: open_count as u32,
         tags: Vec::new(),
     })
+}
+
+fn read_entry(
+    connection: &Connection,
+    track_id: &str,
+) -> Result<Option<LibraryEntry>, LibraryError> {
+    let mut entry = connection
+        .query_row(
+            &format!("{ENTRY_COLUMNS} FROM tracks WHERE track_id = ?1"),
+            [track_id],
+            row_to_entry,
+        )
+        .optional()?;
+    if let Some(entry) = entry.as_mut() {
+        entry.tags = read_tags_for(connection, track_id)?;
+    }
+    Ok(entry)
+}
+
+fn read_tags_for(connection: &Connection, track_id: &str) -> Result<Vec<String>, LibraryError> {
+    let mut statement =
+        connection.prepare("SELECT tag FROM track_tags WHERE track_id = ?1 ORDER BY tag ASC")?;
+    let rows = statement.query_map([track_id], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(LibraryError::from)
+}
+
+/// Mirrors a sidecar's library-only facts into the database: the track's
+/// `last_opened_at`/`open_count` columns and its full `track_tags` set.
+fn sync_sidecar_columns(
+    transaction: &Transaction,
+    track_id: &str,
+    sidecar: &LibrarySidecar,
+) -> Result<(), LibraryError> {
+    transaction.execute(
+        "UPDATE tracks SET last_opened_at = ?2, open_count = ?3 WHERE track_id = ?1",
+        rusqlite::params![track_id, sidecar.last_opened_at, sidecar.open_count],
+    )?;
+    transaction.execute("DELETE FROM track_tags WHERE track_id = ?1", [track_id])?;
+    for tag in &sidecar.tags {
+        transaction.execute(
+            "INSERT OR IGNORE INTO track_tags (track_id, tag) VALUES (?1, ?2)",
+            rusqlite::params![track_id, tag],
+        )?;
+    }
+    Ok(())
+}
+
+fn read_sidecar(workspace: &Path) -> LibrarySidecar {
+    fs::read(workspace.join("library.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_sidecar(workspace: &Path, sidecar: &LibrarySidecar) -> Result<(), LibraryError> {
+    let path = workspace.join("library.json");
+    let temporary = path.with_extension("json.tmp");
+    // A prior crash between create and rename can leave this file behind;
+    // remove it so this write is not permanently blocked by AlreadyExists.
+    let _ = fs::remove_file(&temporary);
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&serde_json::to_vec_pretty(sidecar)?)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|error| LibraryError::from(error.into_error()))?
+        .sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+/// Trims, lowercases, and collapses inner whitespace; rejects the result if
+/// empty, longer than 32 characters, or containing control characters.
+fn normalize_tag(tag: &str) -> Result<String, LibraryError> {
+    let normalized = tag
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if normalized.is_empty()
+        || normalized.chars().count() > 32
+        || normalized.chars().any(char::is_control)
+    {
+        return Err(LibraryError::InvalidTag);
+    }
+    Ok(normalized)
 }
 
 fn split_list(value: &str) -> Vec<String> {
@@ -525,6 +741,19 @@ mod tests {
         connection
             .query_row("SELECT count(*) FROM tracks", [], |row| row.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn normalizes_and_rejects_tags() {
+        assert_eq!(
+            normalize_tag("  Funk   Practice ").unwrap(),
+            "funk practice"
+        );
+        assert_eq!(normalize_tag("Solo").unwrap(), "solo");
+        assert!(normalize_tag("").is_err());
+        assert!(normalize_tag("   ").is_err());
+        assert!(normalize_tag(&"a".repeat(33)).is_err());
+        assert!(normalize_tag("bad\u{0007}tag").is_err());
     }
 
     #[test]

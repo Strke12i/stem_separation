@@ -118,17 +118,96 @@ fn forgets_tracks_whose_workspace_was_deleted_outside_the_app() {
 fn rebuilds_the_index_when_the_database_file_is_corrupted() {
     let temp = TempDir::new().unwrap();
     let ingest = make_ingest(&temp);
-    seed_track(&ingest, "Track.mp3");
+    let track_id = seed_track(&ingest, "Track.mp3");
     {
         let library = LibraryService::open(Arc::clone(&ingest)).unwrap();
         assert_eq!(library.list().unwrap().len(), 1);
+        library.tag(&track_id, "practice").unwrap();
+        library.touch_opened(&track_id).unwrap();
     }
 
     let database_path = ingest.workspace_root().join("library/index.sqlite3");
     fs::write(&database_path, b"not a database").unwrap();
 
     let library = LibraryService::open(Arc::clone(&ingest)).unwrap();
-    assert_eq!(library.list().unwrap().len(), 1);
+    let entries = library.list().unwrap();
+    assert_eq!(entries.len(), 1);
+    // Tags and open history live in the per-track sidecar, not the
+    // database, so they must survive even though the database itself did
+    // not.
+    assert_eq!(entries[0].tags, vec!["practice".to_owned()]);
+    assert_eq!(entries[0].open_count, 1);
+    assert!(entries[0].last_opened_at.is_some());
+}
+
+#[test]
+fn tags_and_history_survive_a_full_rebuild() {
+    let temp = TempDir::new().unwrap();
+    let ingest = make_ingest(&temp);
+    let track_id = seed_track(&ingest, "Track.mp3");
+    let library = LibraryService::in_memory(Arc::clone(&ingest)).unwrap();
+    library.tag(&track_id, "  Funk  ").unwrap();
+    library.touch_opened(&track_id).unwrap();
+    library.touch_opened(&track_id).unwrap();
+
+    let report = library.rebuild().unwrap();
+    assert!(report.rebuilt);
+
+    let entries = library.list().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].tags, vec!["funk".to_owned()]);
+    assert_eq!(entries[0].open_count, 2);
+}
+
+#[test]
+fn searches_and_orders_by_recently_opened() {
+    let temp = TempDir::new().unwrap();
+    let ingest = make_ingest(&temp);
+    let track_a = seed_track(&ingest, "A Song.mp3");
+    let track_b = seed_track(&ingest, "B Song.mp3");
+    let library = LibraryService::in_memory(Arc::clone(&ingest)).unwrap();
+    library.list().unwrap();
+
+    library.touch_opened(&track_b).unwrap();
+
+    let entries = library.list().unwrap();
+    assert_eq!(entries[0].track_id, track_b);
+    assert_eq!(entries[1].track_id, track_a);
+}
+
+#[test]
+fn lists_tags_with_track_counts() {
+    let temp = TempDir::new().unwrap();
+    let ingest = make_ingest(&temp);
+    let track_a = seed_track(&ingest, "A Song.mp3");
+    let track_b = seed_track(&ingest, "B Song.mp3");
+    let library = LibraryService::in_memory(Arc::clone(&ingest)).unwrap();
+    library.tag(&track_a, "funk").unwrap();
+    library.tag(&track_b, "funk").unwrap();
+    library.tag(&track_b, "practice").unwrap();
+
+    let tags = library.tags().unwrap();
+    assert_eq!(tags.len(), 2);
+    let funk = tags.iter().find(|tag| tag.tag == "funk").unwrap();
+    assert_eq!(funk.track_count, 2);
+    let practice = tags.iter().find(|tag| tag.tag == "practice").unwrap();
+    assert_eq!(practice.track_count, 1);
+
+    library.untag(&track_a, "funk").unwrap();
+    let tags = library.tags().unwrap();
+    let funk = tags.iter().find(|tag| tag.tag == "funk").unwrap();
+    assert_eq!(funk.track_count, 1);
+}
+
+#[test]
+fn rejects_an_invalid_tag() {
+    let temp = TempDir::new().unwrap();
+    let ingest = make_ingest(&temp);
+    let track_id = seed_track(&ingest, "Track.mp3");
+    let library = LibraryService::in_memory(Arc::clone(&ingest)).unwrap();
+
+    assert!(library.tag(&track_id, "   ").is_err());
+    assert!(library.tag(&track_id, &"x".repeat(64)).is_err());
 }
 
 #[test]
