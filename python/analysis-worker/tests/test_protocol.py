@@ -6,7 +6,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
-from music_analyzer_worker import PROTOCOL_VERSION
+from music_analyzer_worker import PROTOCOL_VERSION, separation
 from music_analyzer_worker.__main__ import serve
 from music_analyzer_worker.separation import (
     PROFILES,
@@ -14,6 +14,24 @@ from music_analyzer_worker.separation import (
     normalize_outputs,
     offline_network,
 )
+
+
+def copy_model(
+    separator_type: Any,
+    source: Path,
+    output: Path,
+    model_dir: Path,
+    profile: Any,
+    emit_progress: Any,
+) -> list[Path]:
+    """Stands in for the model: every stem is a copy of the source."""
+    produced = []
+    for stem in profile.stems:
+        destination = output / f"lma-{stem}.wav"
+        destination.write_bytes(source.read_bytes())
+        produced.append(destination)
+        emit_progress("separating", 0.5)
+    return produced
 
 
 def messages_for(input_text: str) -> list[dict[str, Any]]:
@@ -133,7 +151,7 @@ def test_separation_emits_progress_and_only_relative_stems(
         encoding="utf-8",
     )
     output = workspace / "tmp" / "job-test"
-    monkeypatch.setenv("LOCAL_MUSIC_ANALYZER_TEST_SEPARATOR", "copy")
+    monkeypatch.setattr(separation, "run_model", copy_model)
     input_text = json.dumps(
         {
             "protocol_version": PROTOCOL_VERSION,
@@ -201,7 +219,7 @@ def test_separation_rejects_a_model_bundle_whose_checksum_no_longer_matches(
         encoding="utf-8",
     )
     output = workspace / "tmp" / "job-test"
-    monkeypatch.setenv("LOCAL_MUSIC_ANALYZER_TEST_SEPARATOR", "copy")
+    monkeypatch.setattr(separation, "run_model", copy_model)
     input_text = json.dumps(
         {
             "protocol_version": PROTOCOL_VERSION,

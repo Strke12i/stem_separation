@@ -16,6 +16,10 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 
 const ENGINE: &str = "librosa.chroma_cqt+templates";
+// Beat-aligned smoothing yields a few segments per second at most; this is
+// generous for many hours of audio while keeping a runaway worker result from
+// bloating the manifest and every IPC response that carries it.
+const MAX_CHORD_SEGMENTS: usize = 50_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,6 +165,7 @@ fn key(source: &str, beats: &[f64]) -> String {
 }
 fn validate(report: &HarmonyReport, duration: f64) -> Result<(), HarmonyError> {
     if report.algorithm != ENGINE
+        || report.chords.len() > MAX_CHORD_SEGMENTS
         || !report.key.score.is_finite()
         || !report.key.margin.is_finite()
         || report.key.tonic.is_empty()
@@ -248,4 +253,44 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), HarmonyError> {
     out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     fs::rename(temporary, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(chords: usize) -> HarmonyReport {
+        HarmonyReport {
+            key: KeyReport {
+                tonic: "C".to_owned(),
+                mode: "major".to_owned(),
+                label: "C major".to_owned(),
+                score: 0.9,
+                second_best: "A minor".to_owned(),
+                margin: 0.1,
+            },
+            chords: (0..chords)
+                .map(|index| ChordSegment {
+                    start: index as f64 * 0.001,
+                    end: index as f64 * 0.001 + 0.0005,
+                    label: "C".to_owned(),
+                    root: Some("C".to_owned()),
+                    quality: Some("major".to_owned()),
+                    score: 0.9,
+                    beat_aligned: false,
+                })
+                .collect(),
+            algorithm: ENGINE.to_owned(),
+            cache_hit: false,
+        }
+    }
+
+    #[test]
+    fn accepts_a_result_at_the_segment_cap_and_rejects_one_above_it() {
+        assert!(validate(&report(MAX_CHORD_SEGMENTS), 1_000.0).is_ok());
+        assert!(matches!(
+            validate(&report(MAX_CHORD_SEGMENTS + 1), 1_000.0),
+            Err(HarmonyError::InvalidResult)
+        ));
+    }
 }

@@ -145,7 +145,8 @@ impl SeparationService {
                         .collect(),
                     installed,
                     detail: if installed {
-                        "Installed locally; no network is used during separation.".to_owned()
+                        "Installed locally; separation runs with the model downloader blocked."
+                            .to_owned()
                     } else {
                         format!("Local bundle required: {}", descriptor.filename)
                     },

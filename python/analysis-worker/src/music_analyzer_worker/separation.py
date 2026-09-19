@@ -1,11 +1,9 @@
-"""Offline-only adapter around audio-separator for Rust-owned separation jobs."""
+"""Adapter around audio-separator for Rust-owned separation jobs (downloader blocked)."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
-import shutil
 import socket
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -82,9 +80,21 @@ def separate(
             "INVALID_WORKSPACE", "Could not create the job output directory."
         ) from error
     emit_progress("loading_model", 0.05)
-    if os.environ.get("LOCAL_MUSIC_ANALYZER_TEST_SEPARATOR") == "copy":
-        return copy_for_test(source, output, profile, emit_progress)
+    produced = run_model(separator_type, source, output, model_dir, profile, emit_progress)
+    artifacts = normalize_outputs(produced, output, profile)
+    emit_progress("validating", 0.92)
+    return {"engine": "audio-separator", "model_id": profile.model_id, "stems": artifacts}
 
+
+def run_model(
+    separator_type: Any,
+    source: Path,
+    output: Path,
+    model_dir: Path,
+    profile: SeparationProfile,
+    emit_progress: Callable[[str, float], None],
+) -> list[Path]:
+    """Run the model and return the files it wrote. Tests replace this seam."""
     try:
         with offline_network():
             separator = separator_type(
@@ -96,7 +106,7 @@ def separate(
             separator.load_model(model_filename=profile.filename)
             emit_progress("separating", 0.2)
             names = {stem.title(): f"lma-{stem}" for stem in profile.stems}
-            produced = [Path(path) for path in separator.separate(str(source), names)]
+            return [Path(path) for path in separator.separate(str(source), names)]
     except SeparationError:
         raise
     except _OfflineNetworkBlocked as error:
@@ -109,10 +119,6 @@ def separate(
         raise SeparationError(
             "SEPARATION_FAILED", "audio-separator could not complete separation."
         ) from error
-
-    artifacts = normalize_outputs(produced, output, profile)
-    emit_progress("validating", 0.92)
-    return {"engine": "audio-separator", "model_id": profile.model_id, "stems": artifacts}
 
 
 def load_separator_type() -> Any:
@@ -243,7 +249,12 @@ class _OfflineNetworkBlocked(OSError):
 
 @contextmanager
 def offline_network() -> Iterator[None]:
-    """Prevent audio-separator's convenience downloader from making a network request."""
+    """Stop audio-separator's convenience downloader from making a network request.
+
+    A Python-level, best-effort guard on ``socket.socket``: it covers
+    ``requests``/``urllib``-style downloads, not native code (ONNX Runtime,
+    PyTorch) and it is not a sandbox.
+    """
     socket_module = cast(Any, socket)
     original_socket = socket_module.socket
 
@@ -255,21 +266,6 @@ def offline_network() -> Iterator[None]:
         yield
     finally:
         socket_module.socket = original_socket
-
-
-def copy_for_test(
-    source: Path,
-    output: Path,
-    profile: SeparationProfile,
-    emit_progress: Callable[[str, float], None],
-) -> dict[str, Any]:
-    artifacts: list[dict[str, str]] = []
-    for index, stem in enumerate(profile.stems, start=1):
-        destination = output / f"{stem}.wav"
-        shutil.copyfile(source, destination)
-        artifacts.append({"stem": stem, "relative_path": destination.name})
-        emit_progress("separating", 0.1 + (0.75 * index / len(profile.stems)))
-    return {"engine": "test-copy", "model_id": profile.model_id, "stems": artifacts}
 
 
 def normalize_outputs(

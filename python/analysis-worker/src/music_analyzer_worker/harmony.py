@@ -56,6 +56,12 @@ def infer_harmony(
     if chroma.shape[0] != 12 or chroma.shape[1] == 0:
         raise HarmonyError("INVALID_HARMONY", "Chroma features are unavailable.")
     aggregate = np.mean(chroma, axis=1)
+    if float(np.linalg.norm(aggregate)) < 1e-9:
+        # Silence scores every key profile 0, so "the best key" would be an
+        # arbitrary pick presented as a result. Refuse instead of persisting it.
+        raise HarmonyError(
+            "SILENT_AUDIO", "No harmonic content was detected; the audio looks silent."
+        )
     key = infer_key(aggregate)
     labels, scores = chord_frames(chroma)
     labels = smooth(labels, 3)
