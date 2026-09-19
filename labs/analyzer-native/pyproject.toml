@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "analyzer-native"
+version = "0.0.0"
+description = "Fase 13 lab: Rust/PyO3 extension benchmarked against the analysis worker"
+requires-python = ">=3.11"
+
+[tool.maturin]
+module-name = "analyzer_native"
