@@ -1,4 +1,4 @@
-use crate::waveform::WaveformPeaks;
+use crate::waveform::{WaveformPeaks, mix_waveforms};
 use rodio::{Decoder, Player, Source, stream::MixerDeviceSink};
 use serde::Serialize;
 use std::fs::File;
@@ -84,6 +84,81 @@ struct LoadedTrack {
     parked_position: Duration,
 }
 
+/// A track whose audio has been inspected (duration and waveform) but that is
+/// not yet playing. Inspecting decodes the file, which takes noticeable time,
+/// so it is a separate step that does not need the engine.
+pub struct PreparedTrack {
+    sources: Vec<LoadedSource>,
+    duration: Duration,
+    waveform: WaveformPeaks,
+}
+
+fn source(stem: Option<String>, path: PathBuf) -> LoadedSource {
+    LoadedSource {
+        stem,
+        path,
+        volume: 1.0,
+        muted: false,
+        solo: false,
+    }
+}
+
+pub fn prepare_track(path: &Path) -> Result<PreparedTrack, AudioError> {
+    let (duration, waveform) = inspect_audio(path)?;
+    Ok(PreparedTrack {
+        sources: vec![source(None, path.to_path_buf())],
+        duration,
+        waveform,
+    })
+}
+
+/// Inspects every stem (in parallel, so the wall time is that of the slowest
+/// one), checks they line up, and combines their peaks into the mix waveform.
+pub fn prepare_stem_mix(stems: Vec<StemInput>) -> Result<PreparedTrack, AudioError> {
+    if stems.len() < 2 || stems.iter().any(|stem| stem.stem.is_empty()) {
+        return Err(AudioError::InvalidStemMix);
+    }
+    let inspected: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = stems
+            .iter()
+            .map(|stem| scope.spawn(|| inspect_audio(&stem.path)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(AudioError::Decode {
+                        detail: "stem inspection panicked".to_owned(),
+                    })
+                })
+            })
+            .collect()
+    });
+
+    let mut duration: Option<Duration> = None;
+    let mut parts = Vec::with_capacity(stems.len());
+    for (stem, result) in stems.iter().zip(inspected) {
+        let (stem_duration, waveform) = result.map_err(|_| AudioError::InvalidStem {
+            stem: stem.stem.clone(),
+        })?;
+        let first = *duration.get_or_insert(stem_duration);
+        if stem_duration.abs_diff(first) > Duration::from_millis(100) {
+            return Err(AudioError::UnsynchronizedStem {
+                stem: stem.stem.clone(),
+            });
+        }
+        parts.push(waveform);
+    }
+    Ok(PreparedTrack {
+        sources: stems
+            .into_iter()
+            .map(|stem| source(Some(stem.stem), stem.path))
+            .collect(),
+        duration: duration.unwrap_or_default(),
+        waveform: mix_waveforms(&parts),
+    })
+}
+
 /// Keeps OS output and transport state inside Rust. The UI only consumes snapshots.
 pub struct AudioEngine {
     output: Option<MixerDeviceSink>,
@@ -112,57 +187,22 @@ impl AudioEngine {
     }
 
     pub fn load(&mut self, path: &Path) -> Result<AudioState, AudioError> {
-        let (duration, waveform) = inspect_audio(path)?;
-        self.stop_players();
-        self.track = Some(LoadedTrack {
-            sources: vec![LoadedSource {
-                stem: None,
-                path: path.to_path_buf(),
-                volume: 1.0,
-                muted: false,
-                solo: false,
-            }],
-            duration,
-            waveform,
-            parked_position: Duration::ZERO,
-        });
-        self.open_players_at(Duration::ZERO, false)?;
-        Ok(self.snapshot())
+        self.install(prepare_track(path)?)
     }
 
     pub fn load_stems(&mut self, stems: Vec<StemInput>) -> Result<AudioState, AudioError> {
-        if stems.len() < 2 || stems.iter().any(|stem| stem.stem.is_empty()) {
-            return Err(AudioError::InvalidStemMix);
-        }
-        let (duration, waveform) =
-            inspect_audio(&stems[0].path).map_err(|_| AudioError::InvalidStem {
-                stem: stems[0].stem.clone(),
-            })?;
-        for stem in &stems[1..] {
-            let stem_duration =
-                inspect_duration(&stem.path).map_err(|_| AudioError::InvalidStem {
-                    stem: stem.stem.clone(),
-                })?;
-            if stem_duration.abs_diff(duration) > Duration::from_millis(100) {
-                return Err(AudioError::UnsynchronizedStem {
-                    stem: stem.stem.clone(),
-                });
-            }
-        }
+        self.install(prepare_stem_mix(stems)?)
+    }
+
+    /// Makes a prepared track current and opens its players. Cheap compared with
+    /// preparing it, so callers that share the engine behind a lock only hold
+    /// the lock for this step.
+    pub fn install(&mut self, prepared: PreparedTrack) -> Result<AudioState, AudioError> {
         self.stop_players();
         self.track = Some(LoadedTrack {
-            sources: stems
-                .into_iter()
-                .map(|stem| LoadedSource {
-                    stem: Some(stem.stem),
-                    path: stem.path,
-                    volume: 1.0,
-                    muted: false,
-                    solo: false,
-                })
-                .collect(),
-            duration,
-            waveform,
+            sources: prepared.sources,
+            duration: prepared.duration,
+            waveform: prepared.waveform,
             parked_position: Duration::ZERO,
         });
         self.open_players_at(Duration::ZERO, false)?;
@@ -494,16 +534,6 @@ fn inspect_audio(path: &Path) -> Result<(Duration, WaveformPeaks), AudioError> {
     ))
 }
 
-fn inspect_duration(path: &Path) -> Result<Duration, AudioError> {
-    let file = File::open(path).map_err(|_| AudioError::MissingAudio)?;
-    let decoder = Decoder::try_from(file).map_err(|error| AudioError::Decode {
-        detail: error.to_string(),
-    })?;
-    decoder.total_duration().ok_or_else(|| AudioError::Decode {
-        detail: "decoder did not report a duration".to_owned(),
-    })
-}
-
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         if !self.players.is_empty() {
@@ -515,10 +545,114 @@ impl Drop for AudioEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioEngine, LoadedSource, LoadedTrack, PlaybackStatus};
+    use super::{
+        AudioEngine, AudioError, LoadedSource, LoadedTrack, PlaybackStatus, StemInput,
+        prepare_stem_mix,
+    };
     use crate::waveform::WaveformPeaks;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    /// Mono 8 kHz 16-bit WAV alternating +amplitude / -amplitude for `seconds`.
+    fn write_square_wav(path: &std::path::Path, amplitude: f32, seconds: u32) {
+        let rate = 8_000_u32;
+        let samples = rate * seconds;
+        let value = (amplitude * 32_768.0) as i16;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + samples * 2).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(samples * 2).to_le_bytes());
+        for index in 0..samples {
+            let sample = if index % 2 == 0 { value } else { -value };
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lma-audio-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn stem(name: &str, path: PathBuf) -> StemInput {
+        StemInput {
+            stem: name.to_owned(),
+            path,
+        }
+    }
+
+    #[test]
+    fn stem_mix_waveform_combines_every_stem() {
+        let dir = scratch_dir("mix");
+        write_square_wav(&dir.join("vocals.wav"), 0.25, 1);
+        write_square_wav(&dir.join("drums.wav"), 0.5, 1);
+
+        let prepared = prepare_stem_mix(vec![
+            stem("vocals", dir.join("vocals.wav")),
+            stem("drums", dir.join("drums.wav")),
+        ])
+        .unwrap();
+
+        assert!(
+            prepared
+                .waveform
+                .max
+                .iter()
+                .all(|peak| (peak - 0.75).abs() < 1e-3)
+        );
+        assert!(
+            prepared
+                .waveform
+                .min
+                .iter()
+                .all(|peak| (peak + 0.75).abs() < 1e-3)
+        );
+        assert_eq!(prepared.sources.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn stem_mix_rejects_stems_of_different_length() {
+        let dir = scratch_dir("length");
+        write_square_wav(&dir.join("vocals.wav"), 0.25, 1);
+        write_square_wav(&dir.join("drums.wav"), 0.25, 2);
+
+        let error = prepare_stem_mix(vec![
+            stem("vocals", dir.join("vocals.wav")),
+            stem("drums", dir.join("drums.wav")),
+        ])
+        .err()
+        .unwrap();
+
+        assert!(matches!(error, AudioError::UnsynchronizedStem { stem } if stem == "drums"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn stem_mix_names_the_stem_that_cannot_be_decoded() {
+        let dir = scratch_dir("missing");
+        write_square_wav(&dir.join("vocals.wav"), 0.25, 1);
+
+        let error = prepare_stem_mix(vec![
+            stem("vocals", dir.join("vocals.wav")),
+            stem("bass", dir.join("bass.wav")),
+        ])
+        .err()
+        .unwrap();
+
+        assert!(matches!(error, AudioError::InvalidStem { stem } if stem == "bass"));
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn new_engine_has_an_empty_snapshot() {

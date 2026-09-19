@@ -1,4 +1,6 @@
-use analyzer_audio::{AudioEngine, AudioState, StemInput};
+use analyzer_audio::{
+    AudioEngine, AudioState, PreparedTrack, StemInput, prepare_stem_mix, prepare_track,
+};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -20,19 +22,24 @@ impl AudioManager {
         }
     }
 
+    // Inspecting a track decodes it, which takes seconds for a stem mix. That
+    // happens before the engine lock is taken: the playback controls and the
+    // position poll share the lock and must not stall behind a load.
     pub fn load_normalized(&self, path: &Path) -> Result<AudioState, String> {
-        self.engine
-            .lock()
-            .map_err(|_| "Audio engine state is unavailable.".to_owned())?
-            .load(path)
-            .map_err(|error| error.to_string())
+        let prepared = prepare_track(path).map_err(|error| error.to_string())?;
+        self.install(prepared)
     }
 
     pub fn load_stems(&self, stems: Vec<StemInput>) -> Result<AudioState, String> {
+        let prepared = prepare_stem_mix(stems).map_err(|error| error.to_string())?;
+        self.install(prepared)
+    }
+
+    fn install(&self, prepared: PreparedTrack) -> Result<AudioState, String> {
         self.engine
             .lock()
             .map_err(|_| "Audio engine state is unavailable.".to_owned())?
-            .load_stems(stems)
+            .install(prepared)
             .map_err(|error| error.to_string())
     }
 
