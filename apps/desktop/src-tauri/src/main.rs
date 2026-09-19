@@ -341,12 +341,41 @@ async fn cached_amt(
 }
 
 #[tauri::command]
-async fn export_amt_midi(
+async fn save_amt_midi(
     track_id: String,
+    suggested_name: String,
     amt: tauri::State<'_, Arc<AmtService>>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Option<String>, String> {
     let amt = Arc::clone(amt.inner());
-    blocking(move || amt.midi_bytes(&track_id).map_err(|error| error.to_string())).await
+    // The dialog and the write both happen in Rust: the UI never sees a path, and a
+    // failure (no permission, disk full) comes back as an error instead of a
+    // silently missing download. Read first so a missing transcription fails
+    // before the user is asked where to save.
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = amt
+            .midi_bytes(&track_id)
+            .map_err(|error| error.to_string())?;
+        let file_name = std::path::Path::new(&suggested_name)
+            .file_name()
+            .map_or_else(
+                || "transcription.mid".to_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+        let Some(destination) = rfd::FileDialog::new()
+            .set_file_name(&file_name)
+            .add_filter("MIDI", &["mid"])
+            .save_file()
+        else {
+            return Ok(None);
+        };
+        std::fs::write(&destination, bytes)
+            .map_err(|error| format!("Could not save the MIDI file: {error}"))?;
+        Ok(destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| format!("MIDI save task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -531,7 +560,7 @@ fn main() {
             cached_pitch,
             transcribe_track,
             cached_amt,
-            export_amt_midi,
+            save_amt_midi,
             library_list,
             library_search,
             library_tags,
