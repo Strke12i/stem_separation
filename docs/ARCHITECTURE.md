@@ -284,7 +284,13 @@ MVP:
 - manifests JSON;
 - filesystem.
 
-SQLite poderá indexar biblioteca posteriormente, sem substituir os manifests.
+SQLite indexa a biblioteca (Fase 12), sem substituir os manifests:
+
+- `<workspace_root>/library/index.sqlite3` é um cache derivado e descartável,
+  reconstruível varrendo `track-*/manifest.json`;
+- fatos exclusivos da biblioteca (tags, histórico de abertura) ficam em
+  `track-*/library.json`, escrito atomicamente; o banco apenas os espelha;
+- um banco corrompido ou de outra versão de schema é apagado e recriado.
 
 ## Invariantes
 

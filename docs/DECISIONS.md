@@ -157,3 +157,15 @@ Benchmark é requisito para otimização.
 Status: accepted
 
 O projeto pode explorar Rust/Python bindings depois, especialmente Python → Rust extensions.
+
+## D-021 — rusqlite bundled como índice derivado da biblioteca
+
+Status: accepted
+
+A biblioteca (Fase 12) usa `rusqlite` com SQLite embutido, síncrono, alinhado ao
+resto do código (I/O de arquivo inline, sem padrão async de banco). O banco é um
+cache derivado: manifests continuam sendo a fonte de verdade (D-016) e tags/histórico
+ficam em `track-*/library.json`, de modo que apagar `index.sqlite3` nunca perde
+dados. Não há framework de migrações: `PRAGMA user_version` diferente da constante
+do código apaga e reconstrói o banco. Busca usa `LIKE` com escape; FTS5 fica fora
+até haver escala que o justifique.

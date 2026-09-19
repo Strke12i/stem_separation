@@ -129,6 +129,25 @@ N
 }
 ```
 
+## Library sidecar
+
+`track-*/library.json` guarda fatos exclusivos da biblioteca que não existem em
+nenhum manifest. Pertence apenas ao `LibraryService`; é a fonte de verdade de tags
+e histórico, e o SQLite o espelha.
+
+```json
+{
+  "schema_version": 1,
+  "tags": ["funk", "practice"],
+  "last_opened_at": "2026-09-19T12:04:11Z",
+  "open_count": 7
+}
+```
+
+Tags são normalizadas (trim, minúsculas, espaços colapsados, 1 a 32 caracteres, sem
+caracteres de controle). Arquivo ausente ou ilegível equivale a "sem tags, nunca
+aberto". `LibraryEntry` devolvido à UI nunca carrega path.
+
 ## Paths
 
 Persistência usa path relativo ao track workspace.

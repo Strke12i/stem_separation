@@ -21,10 +21,18 @@ Não:
 ### Library/Import
 
 ```text
-[ Open audio file ]
+[ Open audio file ]  [ Browse library ]
 
-Recent analyses
+Library
+[ search name, key or tag ]  [ Recent | Name ]
+(funk 2) (practice 1)
+- Track.mp3  3:12 · 120.0 BPM · C major   Stems: demucs-4   opened 3x
+  (funk ×) [ add tag ]                                     [ Open ]
 ```
+
+A aba Library é a primeira aba e a única acessível sem track carregada. Reabrir uma
+track recarrega o áudio e as análises em cache pelos mesmos comandos de sempre; a UI
+só conhece `trackId`, nunca paths.
 
 Ao selecionar:
 

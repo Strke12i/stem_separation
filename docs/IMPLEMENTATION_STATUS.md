@@ -23,7 +23,7 @@ Basic Pitch/ONNX em worker isolado.
 - [x] Fase 9 — Resilience hardening
 - [x] Fase 10 — Performance
 - [x] Fase 11 — Packaging
-- [ ] Fase 12 — Library
+- [x] Fase 12 — Library
 - [ ] Fase 13 — Advanced Rust
 
 ## Registro
@@ -275,6 +275,42 @@ bibliotecas ML grandes e pode levar vários minutos para ser produzido em uma
 máquina Windows. A release pública ainda precisa de revisão de licença da build
 de FFmpeg, medição do tamanho final e assinatura de código.
 Next: Fase 12 — Library.
+
+### Fase 12 — Library
+
+Date: 2026-09-19
+Rust changes: Novo `LibraryService` (`src/library.rs`) sobre `rusqlite` com SQLite
+embutido (`bundled`). O índice em `<workspace_root>/library/index.sqlite3` é um
+cache derivado descartável: `reconcile()` varre `track-*/manifest.json`, pula
+manifests inalterados (gate por mtime + tamanho), remove tracks cujo diretório
+sumiu e `refresh(track_id)` atualiza uma única linha após cada operação. Um
+arquivo corrompido ou com `user_version` diferente é apagado e recriado vazio.
+Tags e histórico de abertura vivem em um sidecar `track-*/library.json`
+(escrito com temp → fsync → rename), não no banco; o SQLite apenas os espelha,
+então apagar o banco nunca perde dados. `search()` combina texto (nome, key,
+tags; `%`, `_` e `\` escapados) e interseção de tags, com ordenação por recente
+ou nome. `IngestService` ganhou `workspace_root()`. Sete comandos Tauri
+(`library_list`, `library_search`, `library_tags`, `library_add_tag`,
+`library_remove_tag`, `library_open_track`, `library_rebuild`); os comandos de
+import, separação e análises chamam `library.refresh` ao terminar com sucesso.
+Python changes: None.
+Frontend changes: Nova aba Library (primeira aba, acessível sem track
+carregada) com busca, ordenação, chips de tags, adicionar/remover tags,
+contagem de aberturas, reindexação manual e reabertura de tracks via
+`adoptTrack()`, extraído de `importTrack()`.
+Tests: `tests/library.rs` (indexação, reindexação por mudança de manifest,
+esquecimento de track apagada, refresh unitário, recuperação de banco
+corrompido com tags preservadas, tags/histórico após `rebuild()`, ordenação
+por recente, contagem de tags, busca por nome/key/tag, interseção de tags,
+escape de curingas) e testes unitários de schema, normalização de tags e
+`summarize`. Workspace Rust fmt/clippy/test, `svelte-check` e `vite build`
+passaram.
+Known limitations: A aba Library não foi exercitada no app Tauri em execução
+(janela nativa); a verificação foi por tipos, build e leitura da superfície de
+comandos. O índice não observa o filesystem em tempo real: mudanças externas
+são vistas no próximo `list()` (abrir a aba) ou no startup. Não há timeline de
+histórico, apenas `last_opened_at` e `open_count`.
+Next: Fase 13 — Advanced Rust.
 
 ### Ferramenta local de modelos — Demucs
 
