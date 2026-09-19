@@ -254,6 +254,48 @@ async fn cancelling_stops_the_worker_instead_of_waiting_for_it() {
 }
 
 #[tokio::test]
+async fn a_second_separation_is_visibly_queued_and_cancellable_without_touching_the_first() {
+    let temp = TempDir::new().unwrap();
+    let (_ingest, first, _workers, service, running) = start_hanging_separation(&temp).await;
+    // Another track in the same workspace root, requested while the first runs.
+    let (_other_ingest, second) = prepare_workspace(&temp);
+    let queued = tokio::spawn({
+        let service = Arc::clone(&service);
+        let second = second.clone();
+        async move { service.separate(second, "demucs-4".to_owned()).await }
+    });
+
+    let mut status = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        status = service.status_for_track(&second).await;
+        if status.is_some() {
+            break;
+        }
+    }
+    let status = status.expect("a waiting separation must expose a status");
+    assert_eq!(status.stage, "Queued behind another separation");
+    assert_eq!(status.progress, 0.0);
+
+    assert!(service.cancel_for_track(&second).await);
+    let error = tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .expect("a queued job must be cancellable without waiting for the running one")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert!(service.status_for_track(&second).await.is_none());
+
+    // The first separation was not affected.
+    let first_status = service.status_for_track(&first).await.unwrap();
+    assert_eq!(first_status.stage, "Separating stems locally");
+    assert!(!first_status.cancel_requested);
+
+    assert!(service.cancel_for_track(&first).await);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+}
+
+#[tokio::test]
 async fn doctor_reports_busy_and_restart_cancels_the_running_job() {
     let temp = TempDir::new().unwrap();
     let (_ingest, _track_id, workers, _service, running) = start_hanging_separation(&temp).await;

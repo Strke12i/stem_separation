@@ -15,12 +15,12 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Instant;
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 const MODEL_FOUR: &str = "demucs-4";
 const MODEL_SIX: &str = "demucs-6-experimental";
@@ -70,11 +70,72 @@ pub struct SeparationService {
     scheduler: Arc<ResourceScheduler>,
     execution: Mutex<()>,
     active: Mutex<Option<ActiveJob>>,
+    // Jobs that have been asked for but are not running yet: waiting for the
+    // previous separation to finish, or verifying the model. They are visible
+    // (and cancellable) so the UI does not have to invent a "starting" state.
+    pending: PendingMap,
+    pending_cancelled: Notify,
     // Verifying a model bundle's checksums means hashing hundreds of MB of
     // weights; that cost is paid at most once per model per app session
     // instead of on every separation, while still catching a corrupted or
     // tampered local install since the process started.
     bundle_verified: Mutex<HashMap<String, Result<(), String>>>,
+}
+
+struct PendingJob {
+    model_id: String,
+    stage: &'static str,
+    since: Instant,
+    cancelled: bool,
+}
+
+type PendingMap = StdMutex<HashMap<String, PendingJob>>;
+
+fn relock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Registers a track as pending and unregisters it however the request ends.
+struct PendingGuard<'a> {
+    map: &'a PendingMap,
+    track_id: String,
+}
+
+impl<'a> PendingGuard<'a> {
+    fn enter(map: &'a PendingMap, track_id: &str, model_id: &str) -> Self {
+        relock(map).insert(
+            track_id.to_owned(),
+            PendingJob {
+                model_id: model_id.to_owned(),
+                stage: "Queued behind another separation",
+                since: Instant::now(),
+                cancelled: false,
+            },
+        );
+        Self {
+            map,
+            track_id: track_id.to_owned(),
+        }
+    }
+
+    fn set_stage(&self, stage: &'static str) {
+        if let Some(job) = relock(self.map).get_mut(&self.track_id) {
+            job.stage = stage;
+        }
+    }
+
+    /// Stops being pending; true when a cancel arrived in the meantime.
+    fn leave(&self) -> bool {
+        relock(self.map)
+            .remove(&self.track_id)
+            .is_some_and(|job| job.cancelled)
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        relock(self.map).remove(&self.track_id);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +186,8 @@ impl SeparationService {
             scheduler,
             execution: Mutex::new(()),
             active: Mutex::new(None),
+            pending: StdMutex::new(HashMap::new()),
+            pending_cancelled: Notify::new(),
             bundle_verified: Mutex::new(HashMap::new()),
         }
     }
@@ -160,7 +223,13 @@ impl SeparationService {
         track_id: String,
         model_id: String,
     ) -> Result<SeparationReport, SeparationError> {
-        let _guard = self.execution.lock().await;
+        let pending = PendingGuard::enter(&self.pending, &track_id, &model_id);
+        // Waiting behind another separation must stay cancellable.
+        let _guard = tokio::select! {
+            guard = self.execution.lock() => guard,
+            () = self.wait_pending_cancelled(&track_id) => return Err(SeparationError::Cancelled),
+        };
+        pending.set_stage("Preparing local workspace");
         let descriptor = descriptor(&model_id).ok_or(SeparationError::UnknownModel)?;
         let workspace = self
             .ingest
@@ -195,6 +264,9 @@ impl SeparationService {
         }
 
         let job_id = JobId::new();
+        if pending.leave() {
+            return Err(SeparationError::Cancelled);
+        }
         {
             let mut active = self.active.lock().await;
             *active = Some(ActiveJob {
@@ -361,11 +433,36 @@ impl SeparationService {
             self.workers.cancel_job(&job.job_id);
             return true;
         }
-        false
+        drop(active);
+        // Not running yet: it will stop before it starts.
+        let marked = relock(&self.pending)
+            .get_mut(track_id)
+            .map(|job| job.cancelled = true)
+            .is_some();
+        if marked {
+            self.pending_cancelled.notify_waiters();
+        }
+        marked
+    }
+
+    async fn wait_pending_cancelled(&self, track_id: &str) {
+        loop {
+            let notified = self.pending_cancelled.notified();
+            tokio::pin!(notified);
+            // Register interest before checking so a cancel in between is not lost.
+            notified.as_mut().enable();
+            if relock(&self.pending)
+                .get(track_id)
+                .is_some_and(|job| job.cancelled)
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub async fn status_for_track(&self, track_id: &str) -> Option<SeparationStatus> {
-        self.active.lock().await.as_ref().and_then(|job| {
+        let running = self.active.lock().await.as_ref().and_then(|job| {
             (job.track_id == track_id).then(|| SeparationStatus {
                 job_id: job.job_id.to_string(),
                 model_id: job.model_id.clone(),
@@ -374,6 +471,18 @@ impl SeparationService {
                 elapsed_seconds: job.started_at.elapsed().as_secs(),
                 cancel_requested: job.cancelled,
             })
+        });
+        running.or_else(|| {
+            relock(&self.pending)
+                .get(track_id)
+                .map(|job| SeparationStatus {
+                    job_id: "pending".to_owned(),
+                    model_id: job.model_id.clone(),
+                    stage: job.stage.to_owned(),
+                    progress: 0.0,
+                    elapsed_seconds: job.since.elapsed().as_secs(),
+                    cancel_requested: job.cancelled,
+                })
         })
     }
 
