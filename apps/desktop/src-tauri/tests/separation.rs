@@ -155,11 +155,20 @@ async fn cancellation_never_promotes_partial_outputs() {
         let track_id = track_id.clone();
         async move { service.separate(track_id, "demucs-4".to_owned()).await }
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let status = service
-        .status_for_track(&track_id)
-        .await
-        .expect("active separation must expose a status");
+    // Python start-up and the bundle checksum vary with machine load, so wait
+    // for the worker's second progress event instead of sleeping a fixed time.
+    let mut status = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        status = service.status_for_track(&track_id).await;
+        if status
+            .as_ref()
+            .is_some_and(|status| status.stage == "Separating stems locally")
+        {
+            break;
+        }
+    }
+    let status = status.expect("active separation must expose a status");
     assert_eq!(status.stage, "Separating stems locally");
     assert_eq!(status.progress, 0.5);
     assert!(service.cancel_for_track(&track_id).await);
