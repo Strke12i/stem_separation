@@ -185,3 +185,18 @@ experimentos reproduzíveis (`waveform_benchmark`, `labs/analyzer-native`).
 Reavaliar a extensão PyO3 apenas se uma etapa de Python passar a custar uma
 fração relevante do tempo de análise.
 
+## D-023 — Cancelar um job descarta o processo do worker
+
+Status: accepted
+
+Cancelar uma separação só marcava uma flag: o Demucs seguia por minutos e o
+resultado era jogado fora. Interromper a inferência dentro do Python não é
+confiável (não há ponto de cancelamento no modelo), então cancelar passa a
+abandonar a requisição e matar o processo do worker; o próximo pedido inicia um
+processo novo. Isso mantém a invariante de que o Rust é dono do ciclo de vida do
+job e reaproveita o descarte que já existia para workers dessincronizados. O
+custo é recarregar o modelo na próxima separação, e o cancelamento deliberado
+não conta para o limite de reinícios automáticos. `restart_worker` cancela o job
+em andamento em vez de esperá-lo, e o "Check engine" responde "busy" enquanto um
+job usa o worker.
+

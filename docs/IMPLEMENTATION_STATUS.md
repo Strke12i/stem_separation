@@ -346,8 +346,56 @@ Known limitations: Resampling próprio, primitivas de DSP em Rust e efeitos de
 resampling na reprodução) e D-019 exige uma medição que justifique o código.
 `smooth` continua em Python (≈60–90 ms por faixa). Os números vêm de uma única
 máquina Windows e de uma única faixa.
-Next: Backlog (loop A/B, metrônomo, time stretch...) ou os itens de hardening
-adiados da auditoria.
+Next: Hardening dos itens adiados da auditoria; depois o Backlog.
+
+### Hardening — itens adiados da auditoria
+
+Date: 2026-09-19
+Commit: ffd9962, bda99c3, 6c8530b, 3b856de, f134ca8, 8bc24c2, 6d6a488
+Rust changes: `WorkerManager::cancel_job` cancela de verdade: a requisição em
+andamento disputa um sinal de cancelamento e o processo do worker é descartado
+(`kill_on_drop`); o próximo pedido sobe um worker novo e um cancelamento
+deliberado não conta para o limite de reinícios. `doctor()` usa `try_lock` e
+responde "busy running a job" em vez de travar durante uma separação, e
+`restart()` cancela o job em andamento. `SeparationService` registra jobs
+pendentes ("Queued behind another separation", depois "Preparing local
+workspace") que aparecem em `separation_status` e podem ser cancelados sem
+esperar o job em execução. O engine de áudio separa `prepare_track` /
+`prepare_stem_mix` (decodificação, fora do lock) de `AudioEngine::install`, e o
+waveform do mix agora soma os picos de todos os stems (`mix_waveforms`) em vez
+de vir só do `stems[0]`. Comandos de disco e SQLite (`cached_*`, `library_*`,
+`reopen_audio_device`) rodam no pool bloqueante em vez da thread principal do
+Tauri; os controles de reprodução continuam síncronos para preservar a ordem
+das chamadas. `save_amt_midi` (diálogo nativo `rfd`) substitui
+`export_amt_midi`. A validação de harmonia rejeita mais de 50.000 segmentos.
+Python changes: Removido o escape hatch `LOCAL_MUSIC_ANALYZER_TEST_SEPARATOR`;
+o modelo é chamado por `run_model()`, que os testes substituem. Áudio silencioso
+na harmonia devolve `SILENT_AUDIO` em vez de uma tonalidade arbitrária.
+Frontend changes: `modelsError` próprio (o erro da lista de modelos não
+sobrescreve mais o erro de uma separação); salvar MIDI passa por `save_amt_midi`.
+Benchmarks: `prepare_stem_mix` com 4 WAVs de 300 s estéreo: ≈500 ms contra
+≈370 ms de um único stem (release; os stems são decodificados em paralelo).
+Tests: cancelamento que retorna rápido contra um worker de 60 s (e falha sem a
+correção), doctor busy + restart cancelando, fila visível e cancelável, envelope
+do mix sobre WAVs reais, erros de stem, descarte de saída inválida e de worker
+morto no AMT (ambos verificados por mutação), erro `SILENT_AUDIO`, limite de
+segmentos.
+Decisions: D-023.
+Not done, on purpose:
+- Journal de jobs em `manifest.jobs`: nenhum serviço persiste estado "em
+  andamento"; artefatos só são promovidos ao terminar e `tmp/<job-id>` órfãos já
+  são limpos. Implementar exigiria tocar todos os serviços sem consumidor na UI.
+  `repair_interrupted_workspaces` ficou documentado como rede de segurança.
+- Modelo recarregado a cada job: o cancelamento agora mata o worker (D-023), o
+  que já descarta o cache, e o ganho (segundos) é pequeno diante da inferência
+  (minutos); não há como validar um cache do `Separator` sem rodar o Demucs.
+- Cancelamento cooperativo em Python: substituído pelo descarte do processo.
+Known limitations: Cancelar uma separação recarrega o modelo na próxima. Um
+`restart` pode deixar um job já enfileirado atrás do cancelado iniciar antes.
+O diálogo de salvar MIDI, o estado "queued" e a aba de modelos não foram
+exercitados no app Tauri em execução (janela nativa); a verificação foi por
+testes Rust/Python, `svelte-check`, `vite build` e clippy.
+Next: Backlog (loop A/B, metrônomo, time stretch...).
 
 ### Ferramenta local de modelos — Demucs
 

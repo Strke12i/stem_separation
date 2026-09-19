@@ -61,7 +61,7 @@ UI recebe events do Rust.
 
 Mostrar:
 
-- queued;
+- queued (uma separação atrás de outra aparece como "Queued behind another separation" e pode ser cancelada);
 - stage;
 - determinate/indeterminate progress;
 - model loading;

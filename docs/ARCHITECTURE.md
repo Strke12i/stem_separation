@@ -192,6 +192,10 @@ Pode ser persistente durante a sessão.
 
 Executa um job pesado por vez inicialmente.
 
+Cancelar um job (ou reiniciar o worker) descarta o processo em vez de esperar o
+job terminar; o próximo pedido inicia um worker novo (D-023). Enquanto um job
+roda, o health check responde "busy" em vez de bloquear.
+
 ### AMT worker
 
 Iniciado sob demanda.
