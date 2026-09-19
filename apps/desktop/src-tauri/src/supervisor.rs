@@ -77,6 +77,8 @@ pub enum SupervisorError {
     WorkerOutOfMemory,
     #[error("analysis worker exceeded the automatic restart limit; restart it manually")]
     RestartLimit,
+    #[error("the job was cancelled and its worker was discarded")]
+    Cancelled,
     #[error("I/O while communicating with analysis worker: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -51,6 +51,9 @@ def respond_separation(request: dict[str, object]) -> None:
     emit({"protocol_version": PROTOCOL_VERSION, "type": "event", "job_id": request["job_id"], "event": "progress", "data": {"stage": "separating", "percent": 0.5}})
     if sys.argv[1] == "separate_slow":
         time.sleep(0.3)
+    if sys.argv[1] == "separate_hang":
+        # Stands in for a Demucs run that would take minutes.
+        time.sleep(60)
     emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"engine": "test-copy", "model_id": "demucs-4", "stems": [{"stem": stem, "relative_path": f"{stem}.wav"} for stem in stems]}})
 
 
@@ -106,7 +109,10 @@ def main() -> None:
     line = sys.stdin.readline()
     if line:
         request = json.loads(line)
-        if mode in {"separate", "separate_slow"} and request.get("method") == "separate":
+        if (
+            mode in {"separate", "separate_slow", "separate_hang"}
+            and request.get("method") == "separate"
+        ):
             respond_separation(request)
         elif mode == "rhythm" and request.get("method") == "analyze_rhythm":
             respond_rhythm(request)

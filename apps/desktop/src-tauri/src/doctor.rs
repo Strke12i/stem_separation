@@ -3,9 +3,11 @@ use analyzer_domain::JobId;
 use analyzer_protocol::{Method, PROTOCOL_VERSION};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
 
 const MAX_AUTOMATIC_RESTARTS: u8 = 3;
@@ -32,6 +34,30 @@ pub struct WorkerManager {
     launch: WorkerLaunch,
     supervisor: Mutex<Option<WorkerSupervisor>>,
     restart_failures: Mutex<u8>,
+    // The supervisor mutex is held for the whole request, so cancellation
+    // cannot go through it. Jobs asked to stop are recorded here and the
+    // running request races `cancel_signal`.
+    cancelled: StdMutex<HashSet<JobId>>,
+    running: StdMutex<Option<JobId>>,
+    cancel_signal: Notify,
+}
+
+/// Marks a job as the one holding the worker; forgets it (and any pending
+/// cancel for it) when the request ends, however it ends.
+struct RunningJob<'a> {
+    manager: &'a WorkerManager,
+    job_id: JobId,
+}
+
+impl Drop for RunningJob<'_> {
+    fn drop(&mut self) {
+        *relock(&self.manager.running) = None;
+        relock(&self.manager.cancelled).remove(&self.job_id);
+    }
+}
+
+fn relock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl WorkerManager {
@@ -46,11 +72,63 @@ impl WorkerManager {
             launch,
             supervisor: Mutex::new(None),
             restart_failures: Mutex::new(0),
+            cancelled: StdMutex::new(HashSet::new()),
+            running: StdMutex::new(None),
+            cancel_signal: Notify::new(),
+        }
+    }
+
+    /// Stops `job_id`: if it holds the worker the request is abandoned and the
+    /// worker process is discarded (the next request starts a fresh one); if it
+    /// is still queued for the worker it never starts.
+    pub fn cancel_job(&self, job_id: &JobId) {
+        relock(&self.cancelled).insert(job_id.clone());
+        self.cancel_signal.notify_waiters();
+    }
+
+    /// Drops a cancel request for a job that no longer needs it (it finished
+    /// before the cancel was seen), so the set cannot grow without bound.
+    pub fn forget_cancel(&self, job_id: &JobId) {
+        relock(&self.cancelled).remove(job_id);
+    }
+
+    fn is_cancelled(&self, job_id: &JobId) -> bool {
+        relock(&self.cancelled).contains(job_id)
+    }
+
+    async fn wait_cancelled(&self, job_id: &JobId) {
+        loop {
+            let notified = self.cancel_signal.notified();
+            tokio::pin!(notified);
+            // Register interest before checking so a cancel between the check
+            // and the await is not lost.
+            notified.as_mut().enable();
+            if self.is_cancelled(job_id) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn begin_job(&self, job_id: &JobId) -> RunningJob<'_> {
+        *relock(&self.running) = Some(job_id.clone());
+        RunningJob {
+            manager: self,
+            job_id: job_id.clone(),
         }
     }
 
     pub async fn doctor(&self) -> DoctorReport {
-        let mut supervisor = self.supervisor.lock().await;
+        // A job holds the supervisor for its whole run (Demucs can take
+        // minutes). Waiting here would freeze the health check, so report the
+        // worker as busy instead; a worker that is running a job is alive.
+        let Ok(mut supervisor) = self.supervisor.try_lock() else {
+            return DoctorReport {
+                desktop_core: ok("Rust host is running"),
+                analysis_worker: ok("busy running a job; health check skipped"),
+                protocol_version: PROTOCOL_VERSION,
+            };
+        };
         let result = ensure_healthy(&mut supervisor, &self.launch).await;
 
         match result {
@@ -72,6 +150,13 @@ impl WorkerManager {
     }
 
     pub async fn restart(&self) -> DoctorReport {
+        // An explicit restart must not wait out a long job: stop the running
+        // one first. A job queued behind it can still start before we get the
+        // lock; jobs are serialized, so at most that one more runs.
+        let running = relock(&self.running).clone();
+        if let Some(job_id) = running {
+            self.cancel_job(&job_id);
+        }
         let mut supervisor = self.supervisor.lock().await;
         *self.restart_failures.lock().await = 0;
         if let Some(mut active) = supervisor.take() {
@@ -248,6 +333,10 @@ impl WorkerManager {
         F: FnMut(&analyzer_protocol::Event),
     {
         let mut supervisor = self.supervisor.lock().await;
+        let _running = self.begin_job(&job_id);
+        if self.is_cancelled(&job_id) {
+            return Err(SupervisorError::Cancelled);
+        }
         if supervisor.is_none() && *self.restart_failures.lock().await >= MAX_AUTOMATIC_RESTARTS {
             return Err(SupervisorError::RestartLimit);
         }
@@ -258,15 +347,17 @@ impl WorkerManager {
         }
         let result = match supervisor.as_mut() {
             Some(active) => {
-                active
-                    .request_with_job_progress(
-                        method.clone(),
-                        job_id,
-                        params,
-                        request_timeout,
-                        on_event,
-                    )
-                    .await
+                let request = active.request_with_job_progress(
+                    method.clone(),
+                    job_id.clone(),
+                    params,
+                    request_timeout,
+                    on_event,
+                );
+                tokio::select! {
+                    result = request => result,
+                    () = self.wait_cancelled(&job_id) => Err(SupervisorError::Cancelled),
+                }
             }
             None => Err(SupervisorError::UnexpectedMessage(
                 "healthy worker was unavailable",
@@ -302,6 +393,11 @@ async fn finish_job_request(
                 _ => "pitch response had no result",
             })),
         },
+        Err(SupervisorError::Cancelled) => {
+            // Deliberate, so it does not count toward the automatic restart limit.
+            info!(?method, "discarding analysis worker after cancellation");
+            Err(SupervisorError::Cancelled)
+        }
         Err(error) => {
             // A malformed, timed-out, or mismatched message leaves stdout framing unknown.
             // Dropping kills the child (`kill_on_drop`), so the next request starts cleanly.

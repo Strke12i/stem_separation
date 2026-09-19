@@ -3,6 +3,7 @@
 use crate::doctor::WorkerManager;
 use crate::ingest::IngestService;
 use crate::scheduler::ResourceScheduler;
+use crate::supervisor::SupervisorError;
 use analyzer_domain::{
     Artifact, ArtifactKind, CreatedBy, JobId, JobStatus, StemKind, TrackManifest,
 };
@@ -257,7 +258,11 @@ impl SeparationService {
             Err(error) => {
                 self.clear_active(&job_id).await;
                 cleanup_temporary_job(&temp_dir);
-                return Err(SeparationError::Worker(error.to_string()));
+                return Err(match error {
+                    // Also reached when the worker is restarted mid-job.
+                    SupervisorError::Cancelled => SeparationError::Cancelled,
+                    other => SeparationError::Worker(other.to_string()),
+                });
             }
         };
         self.update_active(&job_id, "Validating generated stems", 0.92)
@@ -350,6 +355,9 @@ impl SeparationService {
         let mut active = self.active.lock().await;
         if let Some(job) = active.as_mut().filter(|job| job.track_id == track_id) {
             job.cancelled = true;
+            // Stop the worker now instead of letting Demucs run to completion
+            // only to throw the result away.
+            self.workers.cancel_job(&job.job_id);
             return true;
         }
         false
@@ -389,6 +397,8 @@ impl SeparationService {
         if active.as_ref().is_some_and(|job| job.job_id == *job_id) {
             *active = None;
         }
+        // A cancel that arrived after the worker call finished has nothing left to stop.
+        self.workers.forget_cancel(job_id);
     }
 
     async fn ensure_bundle_verified(
