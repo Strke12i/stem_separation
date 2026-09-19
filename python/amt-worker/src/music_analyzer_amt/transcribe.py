@@ -26,9 +26,7 @@ def transcribe(
     assert_within(source, workspace, "input_path")
     assert_within(output, workspace, "output_dir")
     if output.parent.name != "tmp" or output.name != job_id:
-        raise TranscriptionError(
-            "INVALID_WORKSPACE", "Output directory does not match this job."
-        )
+        raise TranscriptionError("INVALID_WORKSPACE", "Output directory does not match this job.")
     if not source.is_file():
         raise TranscriptionError("MISSING_INPUT", "Normalized source is unavailable.")
     if output.exists():
