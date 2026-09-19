@@ -68,7 +68,8 @@ def respond_amt(request: dict[str, object]) -> None:
         return
     output = Path(str(params["output_dir"]))
     output.mkdir(parents=True)
-    (output / "transcription.mid").write_bytes(b"MThd" + b"\x00" * 10)
+    midi = b"not a midi file" if sys.argv[1] == "amt_bad_midi" else b"MThd" + b"\x00" * 10
+    (output / "transcription.mid").write_bytes(midi)
     emit({"protocol_version": PROTOCOL_VERSION, "type": "event", "job_id": request["job_id"], "event": "progress", "data": {"stage": "writing_midi", "percent": 0.85}})
     emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"engine": "basic-pitch", "model": "icassp_2022", "relative_midi_path": "transcription.mid", "notes": [{"start": 0.0, "end": 1.0, "midi": 60, "velocity": 90}]}})
 
@@ -93,6 +94,15 @@ def main() -> None:
     if mode == "hang":
         time.sleep(30)
         return
+    if mode == "amt_crash_once":
+        # First process: complete the handshake, then die. A later process
+        # (the marker file exists) behaves like a healthy AMT worker.
+        marker = Path(sys.argv[2])
+        if not marker.exists():
+            marker.write_text("crashed")
+            hello()
+            return
+        mode = "amt"
 
     hello()
     if mode == "die_after_healthy":
@@ -118,7 +128,7 @@ def main() -> None:
             respond_rhythm(request)
         elif mode == "pitch" and request.get("method") == "analyze_pitch":
             respond_pitch(request)
-        elif mode == "amt" and request.get("method") == "transcribe":
+        elif mode in {"amt", "amt_bad_midi"} and request.get("method") == "transcribe":
             respond_amt(request)
         else:
             respond(request)

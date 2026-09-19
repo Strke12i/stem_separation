@@ -97,3 +97,61 @@ async fn validates_persists_and_reuses_transcription_from_the_sidecar() {
                 && artifact.created_by.stage == "amt")
     );
 }
+
+fn service_in_mode(ingest: &Arc<IngestService>, args: Vec<OsString>) -> AmtService {
+    let mut launch = WorkerLaunch::new(python(), args, Duration::from_secs(5));
+    launch.request_timeout = Duration::from_secs(5);
+    AmtService::new(
+        Arc::clone(ingest),
+        Arc::new(ResourceScheduler::new()),
+        launch,
+    )
+}
+
+#[tokio::test]
+async fn an_invalid_transcription_leaves_no_temporary_or_final_output() {
+    let temporary = TempDir::new().unwrap();
+    let (ingest, track_id) = prepare_workspace(&temporary);
+    let service = service_in_mode(
+        &ingest,
+        vec![fixture().into_os_string(), "amt_bad_midi".into()],
+    );
+
+    let error = service.transcribe(track_id.clone()).await.unwrap_err();
+
+    assert!(error.to_string().contains("invalid"), "{error}");
+    let workspace = ingest.workspace_for(&track_id).unwrap();
+    let leftovers = fs::read_dir(workspace.join("tmp"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        leftovers, 0,
+        "the worker's temporary output must be removed"
+    );
+    assert!(!workspace.join("analysis/amt").exists());
+    let manifest: TrackManifest =
+        serde_json::from_slice(&fs::read(workspace.join("manifest.json")).unwrap()).unwrap();
+    assert!(!manifest.analysis.contains_key("amt"));
+}
+
+#[tokio::test]
+async fn a_crashed_worker_is_discarded_and_the_next_request_starts_a_fresh_one() {
+    let temporary = TempDir::new().unwrap();
+    let (ingest, track_id) = prepare_workspace(&temporary);
+    let marker = temporary.path().join("crashed-once");
+    let service = service_in_mode(
+        &ingest,
+        vec![
+            fixture().into_os_string(),
+            "amt_crash_once".into(),
+            marker.clone().into_os_string(),
+        ],
+    );
+
+    assert!(service.transcribe(track_id.clone()).await.is_err());
+    assert!(marker.exists(), "the first worker process must have run");
+
+    let report = service.transcribe(track_id.clone()).await.unwrap();
+    assert_eq!(report.notes.len(), 1);
+    assert!(!report.cache_hit);
+}

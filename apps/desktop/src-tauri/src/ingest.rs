@@ -242,6 +242,12 @@ impl IngestService {
     }
 
     /// Marks incomplete jobs as failed after an application restart without touching artifacts.
+    ///
+    /// Safety net for a job journal that does not exist yet: today no service
+    /// persists a job or stage as running (artifacts are only promoted when a
+    /// job finishes, and orphaned `tmp/<job-id>` directories are removed by
+    /// `cleanup_stale_temporary`), so this normally repairs nothing. It becomes
+    /// live if a service starts recording in-progress state in the manifest.
     pub fn repair_interrupted_workspaces(&self) -> Result<usize, IngestError> {
         let mut repaired = 0;
         let entries = match fs::read_dir(&self.workspace_root) {
