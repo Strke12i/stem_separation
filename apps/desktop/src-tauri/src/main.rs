@@ -16,6 +16,24 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+/// Tauri runs non-async commands on the main thread, so anything that can wait
+/// on the disk or SQLite (`cached_*` read and validate JSON, library queries,
+/// the library rebuild scans the workspace) would freeze the window. Run such
+/// work on the blocking pool instead.
+///
+/// The playback controls stay synchronous on purpose: they are instant, and
+/// running them on the pool would let two quick calls (dragging a volume
+/// slider) reach the engine out of order.
+async fn blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("Background task failed: {error}"))?
+}
+
 #[tauri::command]
 async fn doctor(state: tauri::State<'_, Arc<WorkerManager>>) -> Result<DoctorReport, String> {
     Ok(Arc::clone(state.inner()).doctor().await)
@@ -170,10 +188,11 @@ fn set_stem_solo(
 }
 
 #[tauri::command]
-fn reopen_audio_device(
+async fn reopen_audio_device(
     audio: tauri::State<'_, Arc<AudioManager>>,
 ) -> Result<analyzer_audio::AudioState, String> {
-    audio.reopen_output_device()
+    let audio = Arc::clone(audio.inner());
+    blocking(move || audio.reopen_output_device()).await
 }
 
 #[tauri::command]
@@ -231,11 +250,12 @@ async fn analyze_rhythm(
 }
 
 #[tauri::command]
-fn cached_rhythm(
+async fn cached_rhythm(
     track_id: String,
     rhythm: tauri::State<'_, Arc<RhythmService>>,
 ) -> Result<Option<RhythmReport>, String> {
-    rhythm.cached(&track_id).map_err(|error| error.to_string())
+    let rhythm = Arc::clone(rhythm.inner());
+    blocking(move || rhythm.cached(&track_id).map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
@@ -255,11 +275,12 @@ async fn analyze_harmony(
 }
 
 #[tauri::command]
-fn cached_harmony(
+async fn cached_harmony(
     track_id: String,
     harmony: tauri::State<'_, Arc<HarmonyService>>,
 ) -> Result<Option<HarmonyReport>, String> {
-    harmony.cached(&track_id).map_err(|error| error.to_string())
+    let harmony = Arc::clone(harmony.inner());
+    blocking(move || harmony.cached(&track_id).map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
@@ -280,14 +301,18 @@ async fn analyze_pitch(
 }
 
 #[tauri::command]
-fn cached_pitch(
+async fn cached_pitch(
     track_id: String,
     stem: String,
     pitch: tauri::State<'_, Arc<PitchService>>,
 ) -> Result<Option<PitchReport>, String> {
-    pitch
-        .cached(&track_id, &stem)
-        .map_err(|error| error.to_string())
+    let pitch = Arc::clone(pitch.inner());
+    blocking(move || {
+        pitch
+            .cached(&track_id, &stem)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -307,78 +332,98 @@ async fn transcribe_track(
 }
 
 #[tauri::command]
-fn cached_amt(
+async fn cached_amt(
     track_id: String,
     amt: tauri::State<'_, Arc<AmtService>>,
 ) -> Result<Option<AmtReport>, String> {
-    amt.cached(&track_id).map_err(|error| error.to_string())
+    let amt = Arc::clone(amt.inner());
+    blocking(move || amt.cached(&track_id).map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
-fn export_amt_midi(
+async fn export_amt_midi(
     track_id: String,
     amt: tauri::State<'_, Arc<AmtService>>,
 ) -> Result<Vec<u8>, String> {
-    amt.midi_bytes(&track_id).map_err(|error| error.to_string())
+    let amt = Arc::clone(amt.inner());
+    blocking(move || amt.midi_bytes(&track_id).map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
-fn library_list(
+async fn library_list(
     library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<Vec<LibraryEntry>, String> {
-    library.list().map_err(|error| error.to_string())
+    let library = Arc::clone(library.inner());
+    blocking(move || library.list().map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
-fn library_search(
+async fn library_search(
     query: LibraryQuery,
     library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<Vec<LibraryEntry>, String> {
-    library.search(&query).map_err(|error| error.to_string())
+    let library = Arc::clone(library.inner());
+    blocking(move || library.search(&query).map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
-fn library_tags(library: tauri::State<'_, Arc<LibraryService>>) -> Result<Vec<LibraryTag>, String> {
-    library.tags().map_err(|error| error.to_string())
+async fn library_tags(
+    library: tauri::State<'_, Arc<LibraryService>>,
+) -> Result<Vec<LibraryTag>, String> {
+    let library = Arc::clone(library.inner());
+    blocking(move || library.tags().map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
-fn library_add_tag(
+async fn library_add_tag(
     track_id: String,
     tag: String,
     library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<LibraryEntry, String> {
-    library
-        .tag(&track_id, &tag)
-        .map_err(|error| error.to_string())
+    let library = Arc::clone(library.inner());
+    blocking(move || {
+        library
+            .tag(&track_id, &tag)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn library_remove_tag(
+async fn library_remove_tag(
     track_id: String,
     tag: String,
     library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<LibraryEntry, String> {
-    library
-        .untag(&track_id, &tag)
-        .map_err(|error| error.to_string())
+    let library = Arc::clone(library.inner());
+    blocking(move || {
+        library
+            .untag(&track_id, &tag)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn library_open_track(
+async fn library_open_track(
     track_id: String,
     library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<LibraryEntry, String> {
-    library
-        .touch_opened(&track_id)
-        .map_err(|error| error.to_string())
+    let library = Arc::clone(library.inner());
+    blocking(move || {
+        library
+            .touch_opened(&track_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-fn library_rebuild(
+async fn library_rebuild(
     library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<LibrarySyncReport, String> {
-    library.rebuild().map_err(|error| error.to_string())
+    let library = Arc::clone(library.inner());
+    blocking(move || library.rebuild().map_err(|error| error.to_string())).await
 }
 
 fn main() {
