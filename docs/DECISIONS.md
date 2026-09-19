@@ -169,3 +169,19 @@ ficam em `track-*/library.json`, de modo que apagar `index.sqlite3` nunca perde
 dados. Não há framework de migrações: `PRAGMA user_version` diferente da constante
 do código apaga e reconstrói o banco. Busca usa `LIKE` com escape; FTS5 fica fora
 até haver escala que o justifique.
+
+## D-022 — Otimizações só entram com medição, e o gargalo real vem primeiro
+
+Status: accepted
+
+Resultado da Fase 13 aplicando D-019 e D-020. Antes de escrever código nativo, o
+custo de cada etapa foi medido numa faixa real. O maior ganho veio de vetorizar
+`chord_frames` e `segment` em NumPy (~45× e ~8×, sem toolchain nova). Peaks de
+waveform (~9% do carregamento, dominado pelo decode) e uma extensão PyO3 para
+`smooth` (10×, mas ≈80 ms por faixa) não justificaram promoção: a primeira ficou
+mais lenta com auto-vetorização e a segunda exigiria Rust no empacotamento do
+sidecar e um wheel por versão de Python e plataforma. Ambos ficam como
+experimentos reproduzíveis (`waveform_benchmark`, `labs/analyzer-native`).
+Reavaliar a extensão PyO3 apenas se uma etapa de Python passar a custar uma
+fração relevante do tempo de análise.
+

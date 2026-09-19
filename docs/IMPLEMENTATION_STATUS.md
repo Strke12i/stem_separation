@@ -24,7 +24,7 @@ Basic Pitch/ONNX em worker isolado.
 - [x] Fase 10 — Performance
 - [x] Fase 11 — Packaging
 - [x] Fase 12 — Library
-- [ ] Fase 13 — Advanced Rust
+- [x] Fase 13 — Advanced Rust
 
 ## Registro
 
@@ -311,6 +311,43 @@ comandos. O índice não observa o filesystem em tempo real: mudanças externas
 são vistas no próximo `list()` (abrir a aba) ou no startup. Não há timeline de
 histórico, apenas `last_opened_at` e `open_count`.
 Next: Fase 13 — Advanced Rust.
+
+### Fase 13 — Advanced Rust
+
+Date: 2026-09-19
+Commit: 892a890, 1f26df6, a76024b
+Rust changes: Nenhuma mudança de produção. `waveform_benchmark` agora roda em
+release sobre um sinal musical sintético e, com um caminho de áudio, mede
+decode isolado e decode + peaks (o que `AudioEngine` faz ao carregar). Duas
+variantes de vetorização (8 lanes de min/max com teste `is_finite` por amostra,
+e lanes com verificação por soma de NaN/inf) foram comparadas ao loop escalar
+atual e conferidas como idênticas.
+Python changes: `chord_frames` passou a pontuar os 24 templates com um produto
+matricial (em blocos de 8192 quadros) e `segment()` ordena os beats uma vez e usa
+`bisect` em `nearest_beat()`. Empates exatos (ex.: quadro com uma só nota) mantêm
+a regra antiga de maior rótulo, agora com tolerância de 1e-9 para não depender do
+arredondamento do BLAS. Um novo laboratório `labs/analyzer-native` (crate
+maturin/PyO3 fora do workspace Cargo) implementa `smooth_labels`.
+Frontend changes: None.
+Benchmarks (Windows de desenvolvimento; faixa real de 257 s, 22 161 quadros):
+`chord_frames` 1228 ms → 27 ms (~45×) e `segment` 242 ms → 28 ms (~8×), com
+rótulos e os 1943 segmentos idênticos à implementação anterior (maior delta de
+score 8,5e-8 por promoção de float32 para float64). Peaks de waveform: decode
+≈535 ms e a redução ≈9% do caminho de carga; as duas variantes de lanes ficaram
+0,85× (mais lentas) que o loop atual. PyO3 `smooth_labels`: 88 ms → 8,8 ms
+(10×), mas ≈80 ms por faixa contra 5–8 s de `chroma_cqt`.
+Tests: `test_harmony_equivalence.py` congela as implementações antigas e compara
+com as novas em entrada aleatória, propensa a empates e silenciosa. Python
+ruff/mypy/pytest, Rust fmt/clippy/test passaram.
+Decisions: D-022 — só o que foi medido entra em produção. Entrou: vetorização
+NumPy. Não entrou: extração de peaks vetorizada e a extensão PyO3.
+Known limitations: Resampling próprio, primitivas de DSP em Rust e efeitos de
+áudio não foram implementados: não há consumidor no produto (o rodio já faz o
+resampling na reprodução) e D-019 exige uma medição que justifique o código.
+`smooth` continua em Python (≈60–90 ms por faixa). Os números vêm de uma única
+máquina Windows e de uma única faixa.
+Next: Backlog (loop A/B, metrônomo, time stretch...) ou os itens de hardening
+adiados da auditoria.
 
 ### Ferramenta local de modelos — Demucs
 

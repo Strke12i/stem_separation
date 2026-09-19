@@ -211,3 +211,7 @@ Se extensões nativas forem adicionadas:
 - usar maturin;
 - build wheels por target;
 - incluir no worker correspondente.
+
+Custo observado no laboratório `labs/analyzer-native` (D-022): build a frio de
+55 s, wheel de 105 KB, um wheel por versão de Python e por plataforma, e Rust no
+build do sidecar. Nenhuma extensão nativa é empacotada hoje.
