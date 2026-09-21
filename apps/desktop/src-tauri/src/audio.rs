@@ -1,5 +1,6 @@
 use analyzer_audio::{
-    AudioEngine, AudioState, PreparedTrack, StemInput, prepare_stem_mix, prepare_track,
+    AudioEngine, AudioState, PreparedTrack, StemInput, StemWaveform, prepare_stem_mix,
+    prepare_track,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -77,6 +78,13 @@ impl AudioManager {
 
     pub fn reopen_output_device(&self) -> Result<AudioState, String> {
         self.with_engine(|engine| engine.reopen_output_device())
+    }
+
+    pub fn stem_waveforms(&self) -> Result<Vec<StemWaveform>, String> {
+        self.engine
+            .lock()
+            .map_err(|_| "Audio engine state is unavailable.".to_owned())
+            .map(|engine| engine.stem_waveforms())
     }
 
     pub fn snapshot(&self) -> Result<AudioState, String> {

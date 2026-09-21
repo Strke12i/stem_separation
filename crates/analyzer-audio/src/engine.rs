@@ -7,7 +7,17 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-const TARGET_WAVEFORM_WINDOWS: usize = 1_200;
+// Waveform resolution follows the track length so a zoomed-in timeline still
+// has detail: about 20 peaks per second, bounded so a very long file cannot
+// produce an unreasonable payload.
+const WAVEFORM_WINDOWS_PER_SECOND: f64 = 20.0;
+const MIN_WAVEFORM_WINDOWS: usize = 1_200;
+const MAX_WAVEFORM_WINDOWS: usize = 40_000;
+
+fn waveform_windows(duration: Duration) -> usize {
+    ((duration.as_secs_f64() * WAVEFORM_WINDOWS_PER_SECOND).ceil() as usize)
+        .clamp(MIN_WAVEFORM_WINDOWS, MAX_WAVEFORM_WINDOWS)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +51,14 @@ pub struct StemState {
     pub solo: bool,
 }
 
+/// One stem's own peaks, for drawing a per-track waveform.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StemWaveform {
+    pub stem: String,
+    pub waveform: WaveformPeaks,
+}
+
 #[derive(Clone, Debug)]
 pub struct StemInput {
     pub stem: String,
@@ -72,6 +90,7 @@ pub enum AudioError {
 struct LoadedSource {
     stem: Option<String>,
     path: PathBuf,
+    waveform: Option<WaveformPeaks>,
     volume: f32,
     muted: bool,
     solo: bool,
@@ -93,10 +112,11 @@ pub struct PreparedTrack {
     waveform: WaveformPeaks,
 }
 
-fn source(stem: Option<String>, path: PathBuf) -> LoadedSource {
+fn source(stem: Option<String>, path: PathBuf, waveform: Option<WaveformPeaks>) -> LoadedSource {
     LoadedSource {
         stem,
         path,
+        waveform,
         volume: 1.0,
         muted: false,
         solo: false,
@@ -106,7 +126,7 @@ fn source(stem: Option<String>, path: PathBuf) -> LoadedSource {
 pub fn prepare_track(path: &Path) -> Result<PreparedTrack, AudioError> {
     let (duration, waveform) = inspect_audio(path)?;
     Ok(PreparedTrack {
-        sources: vec![source(None, path.to_path_buf())],
+        sources: vec![source(None, path.to_path_buf(), None)],
         duration,
         waveform,
     })
@@ -149,13 +169,15 @@ pub fn prepare_stem_mix(stems: Vec<StemInput>) -> Result<PreparedTrack, AudioErr
         }
         parts.push(waveform);
     }
+    let waveform = mix_waveforms(&parts);
     Ok(PreparedTrack {
         sources: stems
             .into_iter()
-            .map(|stem| source(Some(stem.stem), stem.path))
+            .zip(parts)
+            .map(|(stem, peaks)| source(Some(stem.stem), stem.path, Some(peaks)))
             .collect(),
         duration: duration.unwrap_or_default(),
-        waveform: mix_waveforms(&parts),
+        waveform,
     })
 }
 
@@ -206,7 +228,7 @@ impl AudioEngine {
             parked_position: Duration::ZERO,
         });
         self.open_players_at(Duration::ZERO, false)?;
-        Ok(self.snapshot())
+        Ok(self.snapshot_with_waveform())
     }
 
     pub fn play(&mut self) -> Result<AudioState, AudioError> {
@@ -305,8 +327,36 @@ impl AudioEngine {
         Ok(self.snapshot())
     }
 
+    /// Peaks of every stem in a stem mix, in mix order; empty otherwise.
+    #[must_use]
+    pub fn stem_waveforms(&self) -> Vec<StemWaveform> {
+        self.track.as_ref().map_or_else(Vec::new, |track| {
+            track
+                .sources
+                .iter()
+                .filter_map(|source| {
+                    Some(StemWaveform {
+                        stem: source.stem.clone()?,
+                        waveform: source.waveform.clone()?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// Transport state without the waveform. The UI polls this several times a
+    /// second, and the waveform (thousands of points) only changes on load, so
+    /// it travels with the load responses instead (`snapshot_with_waveform`).
     #[must_use]
     pub fn snapshot(&self) -> AudioState {
+        AudioState {
+            waveform: None,
+            ..self.snapshot_with_waveform()
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot_with_waveform(&self) -> AudioState {
         let Some(track) = &self.track else {
             return AudioState {
                 status: PlaybackStatus::Empty,
@@ -498,11 +548,10 @@ fn inspect_audio(path: &Path) -> Result<(Duration, WaveformPeaks), AudioError> {
     let total_samples = duration.as_secs_f64()
         * f64::from(decoder.sample_rate().get())
         * f64::from(decoder.channels().get());
-    let window_size = (total_samples / TARGET_WAVEFORM_WINDOWS as f64)
-        .ceil()
-        .max(1.0) as usize;
-    let mut min = Vec::with_capacity(TARGET_WAVEFORM_WINDOWS + 1);
-    let mut max = Vec::with_capacity(TARGET_WAVEFORM_WINDOWS + 1);
+    let target_windows = waveform_windows(duration);
+    let window_size = (total_samples / target_windows as f64).ceil().max(1.0) as usize;
+    let mut min = Vec::with_capacity(target_windows + 1);
+    let mut max = Vec::with_capacity(target_windows + 1);
     let mut samples_in_window = 0_usize;
     let mut low = 1.0_f32;
     let mut high = -1.0_f32;
@@ -547,7 +596,7 @@ impl Drop for AudioEngine {
 mod tests {
     use super::{
         AudioEngine, AudioError, LoadedSource, LoadedTrack, PlaybackStatus, StemInput,
-        prepare_stem_mix,
+        prepare_stem_mix, waveform_windows,
     };
     use crate::waveform::WaveformPeaks;
     use std::path::PathBuf;
@@ -618,7 +667,56 @@ mod tests {
                 .all(|peak| (peak + 0.75).abs() < 1e-3)
         );
         assert_eq!(prepared.sources.len(), 2);
+        assert!(
+            prepared
+                .sources
+                .iter()
+                .all(|source| source.waveform.is_some())
+        );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn waveform_resolution_follows_duration_within_bounds() {
+        assert_eq!(waveform_windows(Duration::from_secs(10)), 1_200);
+        assert_eq!(waveform_windows(Duration::from_secs(300)), 6_000);
+        assert_eq!(waveform_windows(Duration::from_secs(3 * 3_600)), 40_000);
+    }
+
+    #[test]
+    fn polling_snapshots_omit_the_waveform_but_stems_keep_their_own() {
+        let peaks = |value: f32| WaveformPeaks {
+            sample_windows: 1,
+            min: vec![-value],
+            max: vec![value],
+        };
+        let mut engine = AudioEngine::new();
+        engine.track = Some(LoadedTrack {
+            sources: ["vocals", "drums"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, stem)| LoadedSource {
+                    stem: Some(stem.to_owned()),
+                    path: PathBuf::from(format!("{stem}.wav")),
+                    waveform: Some(peaks(0.25 * (index + 1) as f32)),
+                    volume: 1.0,
+                    muted: false,
+                    solo: false,
+                })
+                .collect(),
+            duration: Duration::from_secs(1),
+            waveform: peaks(0.75),
+            parked_position: Duration::ZERO,
+        });
+
+        assert!(engine.snapshot().waveform.is_none());
+        assert!(engine.snapshot_with_waveform().waveform.is_some());
+        let stems = engine.stem_waveforms();
+        assert_eq!(
+            stems.iter().map(|s| s.stem.as_str()).collect::<Vec<_>>(),
+            ["vocals", "drums"]
+        );
+        assert_eq!(stems[1].waveform.max, vec![0.5]);
     }
 
     #[test]
@@ -679,6 +777,7 @@ mod tests {
                 LoadedSource {
                     stem: Some("vocals".to_owned()),
                     path: PathBuf::from("vocals.wav"),
+                    waveform: None,
                     volume: 1.0,
                     muted: false,
                     solo: false,
@@ -686,6 +785,7 @@ mod tests {
                 LoadedSource {
                     stem: Some("drums".to_owned()),
                     path: PathBuf::from("drums.wav"),
+                    waveform: None,
                     volume: 1.0,
                     muted: false,
                     solo: false,

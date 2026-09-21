@@ -5,6 +5,6 @@ mod waveform;
 
 pub use engine::{
     AudioEngine, AudioError, AudioState, PlaybackStatus, PreparedTrack, StemInput, StemState,
-    prepare_stem_mix, prepare_track,
+    StemWaveform, prepare_stem_mix, prepare_track,
 };
 pub use waveform::{WaveformPeaks, mix_waveforms, waveform_from_samples};

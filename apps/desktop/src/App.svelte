@@ -103,7 +103,9 @@
   }
   async function loadModels(): Promise<void> { try { models = await invoke<SeparationModel[]>('separation_models'); modelsError = undefined; } catch (error) { modelsError = String(error); } }
   function selectTab(tab: Tab): void { activeTab = tab; if (tab === 'library') void refreshLibrary(); void tick().then(drawWaveform); }
-  async function refreshAudio(): Promise<void> { try { audio = await invoke<AudioState>('audio_state'); audioError = undefined; } catch (error) { audioError = String(error); } }
+  // Polling snapshots omit the waveform (it only changes on load), so keep the loaded one.
+  function withWaveform(next: AudioState): AudioState { return next.waveform === null && audio?.waveform ? { ...next, waveform: audio.waveform } : next; }
+  async function refreshAudio(): Promise<void> { try { audio = withWaveform(await invoke<AudioState>('audio_state')); audioError = undefined; } catch (error) { audioError = String(error); } }
   async function refreshSeparation(): Promise<void> {
     if (!track) return;
     try { const value = await invoke<SeparationStatus | null>('separation_status', { trackId: track.trackId }); if (value !== null) separationStatus = value; else if (!separating) separationStatus = undefined; } catch { /* do not interrupt a long-running job */ }
@@ -173,7 +175,7 @@
   }
   async function loadOriginal(trackId: string): Promise<void> { try { audio = await invoke<AudioState>('load_original_track', { trackId }); audioError = undefined; await tick(); drawWaveform(); } catch (error) { audioError = String(error); } }
   async function loadStemMix(modelId: string): Promise<void> { if (!track) return; try { audio = await invoke<AudioState>('load_stem_mix', { trackId: track.trackId, modelId }); audioError = undefined; selectTab('mixer'); await tick(); drawWaveform(); } catch (error) { audioError = String(error); } }
-  async function audioCommand(command: string, args: Record<string, unknown> = {}): Promise<void> { try { audio = await invoke<AudioState>(command, args); audioError = undefined; } catch (error) { audioError = String(error); } }
+  async function audioCommand(command: string, args: Record<string, unknown> = {}): Promise<void> { try { audio = withWaveform(await invoke<AudioState>(command, args)); audioError = undefined; } catch (error) { audioError = String(error); } }
   function scheduleVolume(command: string, args: Record<string, unknown>): void { if (volumeTimer) window.clearTimeout(volumeTimer); volumeTimer = window.setTimeout(() => void audioCommand(command, args), 80); }
 
   async function separate(modelId: string): Promise<void> {

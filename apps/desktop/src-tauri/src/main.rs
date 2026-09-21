@@ -124,6 +124,14 @@ fn audio_state(
 }
 
 #[tauri::command]
+async fn stem_waveforms(
+    audio: tauri::State<'_, Arc<AudioManager>>,
+) -> Result<Vec<analyzer_audio::StemWaveform>, String> {
+    let audio = Arc::clone(audio.inner());
+    blocking(move || audio.stem_waveforms()).await
+}
+
+#[tauri::command]
 fn play_audio(
     audio: tauri::State<'_, Arc<AudioManager>>,
 ) -> Result<analyzer_audio::AudioState, String> {
@@ -539,6 +547,7 @@ fn main() {
             load_original_track,
             load_stem_mix,
             audio_state,
+            stem_waveforms,
             play_audio,
             pause_audio,
             stop_audio,
