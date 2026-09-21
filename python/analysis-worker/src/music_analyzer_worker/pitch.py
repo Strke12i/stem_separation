@@ -12,6 +12,13 @@ import numpy as np
 ENGINE = "pyin"
 SUPPORTED_STEMS = {"bass", "vocals"}
 MIN_NOTE_SECONDS = 0.06
+# Bass and voice fundamentals sit far below 11 kHz, so analysing at 22.05 kHz loses
+# nothing that matters. It also lets pYIN's 2048-sample frame hold the two periods
+# of E1 that it needs (at 44.1 kHz it cannot, which librosa warns about), and it is
+# faster. The default 0.1-semitone pitch grid took about four times longer than 0.15
+# on a four-minute bass stem for the same notes.
+ANALYSIS_SAMPLE_RATE = 22050
+PITCH_RESOLUTION_SEMITONES = 0.15
 
 
 class PitchError(Exception):
@@ -35,7 +42,7 @@ def analyze(params: dict[str, Any], emit_progress: Callable[[str, float], None])
 
     try:
         emit_progress("loading_stem", 0.05)
-        samples, sample_rate = librosa.load(source, sr=None, mono=True)
+        samples, sample_rate = librosa.load(source, sr=ANALYSIS_SAMPLE_RATE, mono=True)
         if samples.size == 0 or sample_rate <= 0:
             raise PitchError("INVALID_AUDIO", "The stem contains no decodable audio.")
         emit_progress("estimating_pitch", 0.25)
@@ -45,6 +52,7 @@ def analyze(params: dict[str, Any], emit_progress: Callable[[str, float], None])
             fmin=fmin,
             fmax=fmax,
             sr=int(sample_rate),
+            resolution=PITCH_RESOLUTION_SEMITONES,
         )
         times = librosa.frames_to_time(np.arange(len(f0)), sr=int(sample_rate)).astype(float)
         emit_progress("segmenting_notes", 0.8)
@@ -89,7 +97,10 @@ def segment_pitch(
         if start is None or midi is None:
             return
         begin_seconds = float(times[start])
-        end_seconds = float(times[end - 1]) + hop_seconds
+        # A note that runs straight into the next one must end exactly where that
+        # one starts: adding a hop to the last frame's time can land a rounding
+        # error past it, and a overlap of 1e-15 s makes the host reject the result.
+        end_seconds = float(times[end]) if end < len(times) else float(times[end - 1]) + hop_seconds
         if end_seconds - begin_seconds >= MIN_NOTE_SECONDS:
             confidence = float(np.nanmean(probabilities[start:end]))
             if not np.isfinite(confidence):
