@@ -534,3 +534,28 @@ testes com ffprobe/ffmpeg de mentira cobrem o caminho de `import`). Nenhum áudi
 ouvido: só o estado do motor (tocando, posição avançando, sem erro de dispositivo).
 Duplicatas antigas seguem na biblioteca; nenhuma é removida automaticamente.
 
+### Correção — Notas por faixa do arranjo (pitch de bass e vocals nunca chegava à tela)
+
+Date: 2026-09-21
+Cause: Reproduzida no app real. "Detect notes" em bass e vocals falhava sempre: primeiro
+com "analysis worker exceeded the request timeout" (o pYIN de um stem leva 100 s ou mais
+contra 8 s do launch de desenvolvimento) e, dado tempo, com "The pitch result returned by
+the analysis worker is invalid": notas coladas se sobrepunham por ~7e-15 s (7 casos no
+baixo). Sem esses resultados, o que sobrava funcionando era a transcrição da mix inteira
+(aba MIDI). O `other` (Basic Pitch) já funcionava por faixa.
+Fix: `ANALYSIS_REQUEST_TIMEOUT` (10 min) para rhythm, harmony e pitch. No worker, cada
+nota termina exatamente no início da seguinte, e o pYIN roda a 22,05 kHz com resolução
+de 0,15 semitom (112 s → 28 s no baixo). Removido `request_job`, sem uso.
+Decisions: D-027.
+Tests: Rust: rhythm, harmony e pitch completam uma análise mais lenta que o timeout do
+launch (falhavam antes). Python: notas coladas nunca se sobrepõem (falha com o código
+antigo). Ruff, mypy e pytest passam.
+Validation: No app real, com o áudio do usuário: baixo 536 notas (E1–E3, 30 s), vocais
+605 notas (C2–A5, 31 s), `other` 1025 notas e 2231 acordes, cada um distinto da mix
+inteira (1209 notas, C#1–G5), visíveis nas faixas do mixer.
+Known limitations: O Demucs de 4 stems mistura guitarra, teclas e sintetizadores em
+`other`: separar por instrumento exige o modelo de 6 stems (guitar e piano), hoje sem
+bundle instalado. A segmentação de acordes é muito picotada (mediana de 0,09 s, tanto na
+mix quanto no `other`, com o ritmo já analisado), o que sugere que não está agrupada por
+batida; já era assim antes e a causa não foi investigada.
+

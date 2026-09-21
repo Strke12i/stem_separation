@@ -243,3 +243,22 @@ causa da decodificação em `opt-level 0`, sem nenhum indicador na UI. Com
 `[profile.dev.package."*"] opt-level = 3` leva 0,76 s. Só as dependências mudam; o
 código do projeto continua depurável. O custo é uma primeira compilação mais longa.
 
+## D-027 — Análises de música inteira têm timeout próprio; pYIN a 22,05 kHz
+
+Status: accepted
+
+O timeout do launch do worker (8 s em desenvolvimento) é para handshake e checagem de
+saúde, mas rhythm, harmony e pitch também o usavam. Analisar um stem de 4 minutos leva
+mais do que isso, então o pitch por faixa expirava e as faixas do arranjo ficavam sem
+notas. Essas três análises passam a ter `ANALYSIS_REQUEST_TIMEOUT` (10 min, como o AMT),
+no mesmo padrão do timeout da separação.
+
+Com o timeout resolvido apareceu o defeito por trás: o worker fechava cada nota em
+`tempo do último quadro + hop`, e em notas coladas isso passa do início da seguinte por
+~1e-15 s. O Rust rejeitava o resultado inteiro como inválido. A nota agora termina
+exatamente onde a seguinte começa. Medido (D-019/D-022) num baixo de 4:17: reamostrar
+para 22,05 kHz e usar resolução de 0,15 semitom leva 28 s em vez de 112 s, sem o aviso
+do librosa sobre o quadro de 2048 amostras ser curto para o E1, e mantém 94 % do tempo
+sonoro na mesma nota da saída anterior (resolução 0,25: 6 s, 86 %, perde notas). Essa
+concordância é contra a saída anterior, não contra uma verdade de referência.
+
