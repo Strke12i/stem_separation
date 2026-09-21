@@ -126,6 +126,10 @@ def main() -> None:
     line = sys.stdin.readline()
     if line:
         request = json.loads(line)
+        if mode.startswith("slow_"):
+            # An analysis that outlasts the short handshake timeout.
+            time.sleep(1.2)
+            mode = mode.removeprefix("slow_")
         if (
             mode in {"separate", "separate_slow", "separate_hang"}
             and request.get("method") == "separate"

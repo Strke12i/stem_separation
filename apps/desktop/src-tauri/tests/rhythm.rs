@@ -89,3 +89,19 @@ async fn validates_persists_and_reuses_rhythm_from_the_sidecar() {
                 && artifact.created_by.stage == "rhythm")
     );
 }
+
+#[tokio::test]
+async fn an_analysis_slower_than_the_handshake_timeout_still_completes() {
+    // The short request timeout is for health checks; a real analysis of a
+    // full song takes far longer and must not be cut off by it.
+    let temporary = TempDir::new().unwrap();
+    let (ingest, track_id) = prepare_workspace(&temporary);
+    let mut launch = WorkerLaunch::new(
+        python(),
+        vec![fixture().into_os_string(), "slow_rhythm".into()],
+        Duration::from_millis(500),
+    );
+    launch.request_timeout = Duration::from_millis(500);
+    let service = RhythmService::new(Arc::clone(&ingest), Arc::new(WorkerManager::new(launch)));
+    assert_eq!(service.analyze(track_id).await.unwrap().bpm, 120.0);
+}

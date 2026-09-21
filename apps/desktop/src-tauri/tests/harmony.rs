@@ -166,3 +166,17 @@ async fn stem_names_that_are_not_stems_never_reach_a_path() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn an_analysis_slower_than_the_handshake_timeout_still_completes() {
+    let temporary = TempDir::new().unwrap();
+    let (ingest, track_id) = prepare_workspace(&temporary);
+    let mut launch = WorkerLaunch::new(
+        python(),
+        vec![fixture().into_os_string(), "slow_harmony".into()],
+        Duration::from_millis(500),
+    );
+    launch.request_timeout = Duration::from_millis(500);
+    let service = HarmonyService::new(Arc::clone(&ingest), Arc::new(WorkerManager::new(launch)));
+    assert!(service.analyze(track_id, None).await.is_ok());
+}

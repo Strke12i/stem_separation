@@ -102,3 +102,18 @@ async fn validates_persists_and_reuses_pitch_from_a_local_stem() {
         artifact.kind == ArtifactKind::Analysis && artifact.created_by.stage == "pitch:bass"
     }));
 }
+
+#[tokio::test]
+async fn an_analysis_slower_than_the_handshake_timeout_still_completes() {
+    let temporary = TempDir::new().unwrap();
+    let (ingest, track_id) = prepare_workspace(&temporary);
+    let mut launch = WorkerLaunch::new(
+        python(),
+        vec![fixture().into_os_string(), "slow_pitch".into()],
+        Duration::from_millis(500),
+    );
+    launch.request_timeout = Duration::from_millis(500);
+    let service = PitchService::new(Arc::clone(&ingest), Arc::new(WorkerManager::new(launch)));
+    let report = service.analyze(track_id, "bass".to_owned()).await.unwrap();
+    assert_eq!(report.notes[0].note, "A2");
+}

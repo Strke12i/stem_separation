@@ -12,8 +12,12 @@ use tracing::{info, warn};
 
 const MAX_AUTOMATIC_RESTARTS: u8 = 3;
 // Demucs runs multiple overlapping chunks and can legitimately take many minutes on CPU.
-// Keep the default timeout short for health checks and lightweight analyses.
+// The launch's own request timeout stays short: it covers health checks.
 const SEPARATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+// The launch's request timeout covers handshakes and health checks. Analysing a
+// whole song (a stem's pitch, chords or beats) takes longer than that on a cold
+// worker, and being cut off there left the arrangement lanes without notes.
+const ANALYSIS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -236,8 +240,14 @@ impl WorkerManager {
         job_id: JobId,
         params: Value,
     ) -> Result<(Value, Vec<analyzer_protocol::Event>), SupervisorError> {
-        self.request_job(Method::AnalyzeRhythm, job_id, params, "rhythm")
-            .await
+        self.request_job_with_timeout(
+            Method::AnalyzeRhythm,
+            job_id,
+            params,
+            "rhythm",
+            ANALYSIS_REQUEST_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn analyze_harmony(
@@ -245,8 +255,14 @@ impl WorkerManager {
         job_id: JobId,
         params: Value,
     ) -> Result<(Value, Vec<analyzer_protocol::Event>), SupervisorError> {
-        self.request_job(Method::AnalyzeHarmony, job_id, params, "harmony")
-            .await
+        self.request_job_with_timeout(
+            Method::AnalyzeHarmony,
+            job_id,
+            params,
+            "harmony",
+            ANALYSIS_REQUEST_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn analyze_pitch(
@@ -254,19 +270,14 @@ impl WorkerManager {
         job_id: JobId,
         params: Value,
     ) -> Result<(Value, Vec<analyzer_protocol::Event>), SupervisorError> {
-        self.request_job(Method::AnalyzePitch, job_id, params, "pitch")
-            .await
-    }
-
-    async fn request_job(
-        &self,
-        method: Method,
-        job_id: JobId,
-        params: Value,
-        stage: &'static str,
-    ) -> Result<(Value, Vec<analyzer_protocol::Event>), SupervisorError> {
-        self.request_job_with_timeout(method, job_id, params, stage, self.launch.request_timeout)
-            .await
+        self.request_job_with_timeout(
+            Method::AnalyzePitch,
+            job_id,
+            params,
+            "pitch",
+            ANALYSIS_REQUEST_TIMEOUT,
+        )
+        .await
     }
 
     async fn request_job_with_timeout(
