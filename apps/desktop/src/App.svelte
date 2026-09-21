@@ -6,7 +6,7 @@
 
   type ComponentStatus = { ok: boolean; detail: string };
   type DoctorReport = { desktopCore: ComponentStatus; analysisWorker: ComponentStatus; protocolVersion: number };
-  type Track = { trackId: string; originalName: string; durationSeconds: number; sampleRate: number; channels: number };
+  type Track = { trackId: string; originalName: string; durationSeconds: number; sampleRate: number; channels: number; reused?: boolean };
   type AudioState = { status: 'empty' | 'paused' | 'playing' | 'ended' | 'device_error'; currentPositionSeconds: number; durationSeconds: number; volume: number; deviceError: string | null; waveform: { min: number[]; max: number[] } | null; stemMix: boolean; stems: StemState[] };
   type StemState = { stem: string; volume: number; muted: boolean; solo: boolean };
   type SeparationModel = { id: string; label: string; experimental: boolean; stems: string[]; installed: boolean; detail: string };
@@ -56,6 +56,8 @@
   let separating: string | undefined;
   let separationStatus: SeparationStatus | undefined;
   let separationResult: SeparationReport | undefined;
+  let openingMixer = false;
+  let reusedNotice: string | undefined;
   let rhythm: RhythmReport | undefined;
   let harmony: HarmonyReport | undefined;
   let pitch: Record<string, PitchReport | undefined> = {};
@@ -123,16 +125,32 @@
   }
   async function adoptTrack(next: Track): Promise<void> {
     stopMidiPreview(); track = next; activeTab = 'workspace'; midiWindowStart = 0; rhythm = undefined; harmony = undefined; pitch = {}; amt = undefined; midiSavedAs = undefined;
-    separationResult = undefined; separating = undefined; separationStatus = undefined; separationError = undefined;
+    separationResult = undefined; separating = undefined; separationStatus = undefined; separationError = undefined; reusedNotice = undefined;
     stemWaveforms = []; stemAmt = {}; stemHarmony = {}; laneBusy = {}; laneErrors = {}; laneBatch = undefined;
+    // Saved stems do not depend on the original track being decoded, so check for them meanwhile.
+    const savedStems = loadCachedSeparation(next.trackId);
     await loadOriginal(next.trackId);
-    await Promise.all([loadCachedRhythm(next.trackId), loadCachedHarmony(next.trackId), loadCachedPitch(next.trackId, 'bass'), loadCachedPitch(next.trackId, 'vocals'), loadCachedAmt(next.trackId)]);
+    await Promise.all([loadCachedRhythm(next.trackId), loadCachedHarmony(next.trackId), loadCachedPitch(next.trackId, 'bass'), loadCachedPitch(next.trackId, 'vocals'), loadCachedAmt(next.trackId), savedStems]);
+  }
+  // Stems already separated for this song (even under another import of it) are
+  // offered straight away instead of asking the user to separate again.
+  async function loadCachedSeparation(trackId: string): Promise<void> {
+    for (const modelId of ['demucs-6-experimental', 'demucs-4']) {
+      try {
+        const cached = await invoke<SeparationReport | null>('cached_separation', { trackId, modelId });
+        if (cached && track?.trackId === trackId && !separating) { separationResult = cached; return; }
+      } catch { /* an optimisation: the Separate button still works without it */ }
+    }
   }
   async function importTrack(): Promise<void> {
     importing = true; importError = undefined;
     try {
       const result = await invoke<Track | null>('pick_and_import');
-      if (result) { await adoptTrack(result); void refreshLibrary(); }
+      if (result) {
+        await adoptTrack(result);
+        if (result.reused) reusedNotice = 'This song was already in your library, so its saved stems and analyses were reused.';
+        void refreshLibrary();
+      }
     } catch (error) { importError = String(error); }
     finally { importing = false; }
   }
@@ -186,7 +204,13 @@
     finally { libraryBusy = false; }
   }
   async function loadOriginal(trackId: string): Promise<void> { try { audio = await invoke<AudioState>('load_original_track', { trackId }); audioError = undefined; await tick(); drawWaveform(); } catch (error) { audioError = String(error); } }
-  async function loadStemMix(modelId: string): Promise<void> { if (!track) return; try { audio = await invoke<AudioState>('load_stem_mix', { trackId: track.trackId, modelId }); audioError = undefined; selectTab('mixer'); await tick(); drawWaveform(); void loadArrangementData(); } catch (error) { audioError = String(error); } }
+  async function loadStemMix(modelId: string): Promise<void> {
+    if (!track || openingMixer) return;
+    openingMixer = true; separationError = undefined;
+    try { audio = await invoke<AudioState>('load_stem_mix', { trackId: track.trackId, modelId }); audioError = undefined; selectTab('mixer'); await tick(); drawWaveform(); void loadArrangementData(); }
+    catch (error) { audioError = String(error); separationError = `Could not open the mixer: ${String(error)}`; }
+    finally { openingMixer = false; }
+  }
   async function audioCommand(command: string, args: Record<string, unknown> = {}): Promise<void> { try { audio = withWaveform(await invoke<AudioState>(command, args)); audioError = undefined; } catch (error) { audioError = String(error); } }
   function scheduleVolume(command: string, args: Record<string, unknown>): void { if (volumeTimer) window.clearTimeout(volumeTimer); volumeTimer = window.setTimeout(() => void audioCommand(command, args), 80); }
 
@@ -322,7 +346,7 @@
   {#if report !== undefined && !report.analysisWorker.ok}<p class="error compact">{report.analysisWorker.detail}</p>{/if}
 
   {#if track !== undefined}
-    <section class="track-strip"><div class="track-art">♫</div><div class="track-meta"><p class="eyebrow">CURRENT SOURCE</p><h2>{track.originalName}</h2><p>{formatTime(track.durationSeconds)} · {track.sampleRate / 1000} kHz · {track.channels === 1 ? 'Mono' : 'Stereo'}</p></div><button class="secondary" type="button" disabled={importing} onclick={importTrack}>{importing ? 'Importing…' : 'Replace track'}</button></section>
+    <section class="track-strip"><div class="track-art">♫</div><div class="track-meta"><p class="eyebrow">CURRENT SOURCE</p><h2>{track.originalName}</h2><p>{formatTime(track.durationSeconds)} · {track.sampleRate / 1000} kHz · {track.channels === 1 ? 'Mono' : 'Stereo'}</p></div><button class="secondary" type="button" disabled={importing} onclick={importTrack}>{importing ? 'Importing…' : 'Replace track'}</button></section>{#if reusedNotice}<p class="detail" role="status">{reusedNotice}</p>{/if}
   {/if}
   {#if track !== undefined || activeTab === 'library'}
     <nav class="tabs" aria-label="Workbench sections">{#each tabs as tab}<button type="button" role="tab" aria-selected={activeTab === tab.id} disabled={track === undefined && tab.id !== 'library'} class:active={activeTab === tab.id} onclick={() => selectTab(tab.id)}><span>{tab.icon}</span>{tab.label}</button>{/each}</nav>
@@ -372,7 +396,7 @@
       <section class="panel"><div class="heading"><div><p class="eyebrow">SOURCE TRANSPORT</p><h2>{audio?.stemMix ? 'Stem mix loaded' : 'Original track'}</h2></div><em>{audio?.status ?? 'loading'}</em></div>{#if audio && audio.status !== 'empty'}<canvas bind:this={waveformCanvas} width="900" height="150" aria-label="Waveform overview"></canvas><div class="readout"><strong>{formatTime(audio.currentPositionSeconds)}</strong><span>/ {formatTime(audio.durationSeconds)}</span></div><input type="range" min="0" max={audio.durationSeconds} step="0.01" value={seeking ? seekValue : audio.currentPositionSeconds} oninput={(event) => { seeking = true; seekValue = Number(event.currentTarget.value); }} onchange={(event) => { seeking = false; void audioCommand('seek_audio', { seconds: Number(event.currentTarget.value) }); }} /><div class="actions"><button class="primary" type="button" onclick={() => audioCommand('play_audio')}>▶ Play</button><button class="secondary" type="button" onclick={() => audioCommand('pause_audio')}>Pause</button><button class="secondary" type="button" onclick={() => audioCommand('stop_audio')}>Stop</button><button class="ghost" type="button" onclick={() => audioCommand('reopen_audio_device')}>Reconnect output</button></div><label class="slider-label">Master output<input type="range" min="0" max="2" step="0.01" value={audio.volume} oninput={(event) => scheduleVolume('set_master_volume', { volume: Number(event.currentTarget.value) })} /></label>{/if}{#if audioError}<p class="error">{audioError}</p>{/if}</section>
       <section class="quick-grid"><button type="button" onclick={() => selectTab('separation')}><span>✦</span><strong>Generate stems</strong><small>Demucs locally</small></button><button type="button" onclick={() => selectTab('transcription')}><span>♫</span><strong>Make MIDI sketch</strong><small>Basic Pitch</small></button><button type="button" onclick={() => selectTab('analysis')}><span>⌁</span><strong>Analyze song</strong><small>BPM, key, chords</small></button></section>
     {:else if activeTab === 'separation'}
-      <section class="panel"><div class="heading"><div><p class="eyebrow">STEM SEPARATION</p><h2>Split the source into playable parts.</h2></div><em>LOCAL ONLY</em></div>{#if separating || separationStatus}<div class="progress" role="status"><div class="heading"><div><p class="eyebrow">{separationStatus?.modelId ?? separating}</p><h3>{separationStatus?.cancelRequested ? 'Cancellation requested' : separationStatus?.stage ?? 'Starting separation'}</h3></div><strong>{formatTime(separationStatus?.elapsedSeconds ?? 0)}</strong></div><div class="progress-bar"><span class:working={!separationStatus?.cancelRequested} style={`width:${Math.max(5, (separationStatus?.progress ?? 0.05) * 100)}%`}></span></div><p>Demucs is processing locally. CPU jobs can take several minutes; the bar advances at verified worker checkpoints.</p><ol>{#each separationSteps as step, index}<li class={stepState(index)}><i></i>{step.label}</li>{/each}</ol><button class="danger" type="button" disabled={separationStatus?.cancelRequested === true} onclick={cancelSeparation}>{separationStatus?.cancelRequested ? 'Cancelling after model step…' : 'Cancel safely'}</button></div>{:else}<div class="model-grid">{#each models as model}<article class:unavailable={!model.installed}><div><span>✦</span><i class:ready={model.installed}></i></div><h3>{model.label}</h3><p>{model.stems.join(' · ')}</p><small>{model.detail}</small><button class:primary={model.installed} class="secondary" type="button" disabled={!model.installed} onclick={() => separate(model.id)}>{model.installed ? 'Separate track' : 'Bundle required'}</button></article>{/each}</div><details><summary>Need to install Demucs locally?</summary><p>Models are never downloaded while the desktop app is running.</p><code>powershell -ExecutionPolicy Bypass -File .\scripts\install-demucs.ps1 -Model demucs-4</code></details>{/if}{#if separationResult}<div class="success"><b>✓</b><div><strong>{separationResult.cacheHit ? 'Using cached stems' : 'Stems are ready'}</strong><p>{separationResult.stems.join(', ')} · {separationResult.progressEvents} worker checkpoints</p></div><button class="primary" type="button" onclick={() => loadStemMix(separationResult?.modelId ?? '')}>Open mixer</button></div>{/if}{#if separationError}<p class="error">{separationError}</p>{/if}{#if modelsError}<p class="error">Could not list separation models: {modelsError}</p>{/if}</section>
+      <section class="panel"><div class="heading"><div><p class="eyebrow">STEM SEPARATION</p><h2>Split the source into playable parts.</h2></div><em>LOCAL ONLY</em></div>{#if separating || separationStatus}<div class="progress" role="status"><div class="heading"><div><p class="eyebrow">{separationStatus?.modelId ?? separating}</p><h3>{separationStatus?.cancelRequested ? 'Cancellation requested' : separationStatus?.stage ?? 'Starting separation'}</h3></div><strong>{formatTime(separationStatus?.elapsedSeconds ?? 0)}</strong></div><div class="progress-bar"><span class:working={!separationStatus?.cancelRequested} style={`width:${Math.max(5, (separationStatus?.progress ?? 0.05) * 100)}%`}></span></div><p>Demucs is processing locally. CPU jobs can take several minutes; the bar advances at verified worker checkpoints.</p><ol>{#each separationSteps as step, index}<li class={stepState(index)}><i></i>{step.label}</li>{/each}</ol><button class="danger" type="button" disabled={separationStatus?.cancelRequested === true} onclick={cancelSeparation}>{separationStatus?.cancelRequested ? 'Cancelling after model step…' : 'Cancel safely'}</button></div>{:else}<div class="model-grid">{#each models as model}<article class:unavailable={!model.installed}><div><span>✦</span><i class:ready={model.installed}></i></div><h3>{model.label}</h3><p>{model.stems.join(' · ')}</p><small>{model.detail}</small><button class:primary={model.installed} class="secondary" type="button" disabled={!model.installed} onclick={() => separate(model.id)}>{model.installed ? 'Separate track' : 'Bundle required'}</button></article>{/each}</div><details><summary>Need to install Demucs locally?</summary><p>Models are never downloaded while the desktop app is running.</p><code>powershell -ExecutionPolicy Bypass -File .\scripts\install-demucs.ps1 -Model demucs-4</code></details>{/if}{#if separationResult}<div class="success"><b>✓</b><div><strong>{separationResult.cacheHit ? 'Using cached stems' : 'Stems are ready'}</strong><p>{separationResult.stems.join(', ')} · {separationResult.cacheHit ? 'saved on this computer, no reprocessing needed' : `${separationResult.progressEvents} worker checkpoints`}</p></div><button class="primary" type="button" disabled={openingMixer} onclick={() => loadStemMix(separationResult?.modelId ?? '')}>{openingMixer ? 'Opening mixer…' : 'Open mixer'}</button></div>{/if}{#if separationError}<p class="error">{separationError}</p>{/if}{#if modelsError}<p class="error">Could not list separation models: {modelsError}</p>{/if}</section>
     {:else if activeTab === 'transcription'}
       <section class="panel"><div class="heading"><div><p class="eyebrow">POLYPHONIC TRANSCRIPTION</p><h2>Turn the source into a MIDI sketch.</h2></div><em>{amt?.cacheHit ? 'cached' : amt?.engine ?? 'not generated'}</em></div>{#if !amt}<div class="empty"><span>♫</span><h3>No MIDI sketch yet</h3><p>Basic Pitch generates local note data and a MIDI artifact from the original track.</p><button class="primary" type="button" disabled={transcribing} onclick={transcribe}>{transcribing ? 'Transcribing locally…' : 'Transcribe original to MIDI'}</button></div>{:else}<div class="midi-toolbar"><div><strong>{amt.notes.length}</strong><span>notes detected</span></div><div class="actions"><button class="primary" type="button" disabled={midiPreviewPlaying} onclick={playMidiPreview}>▶ Preview {MIDI_PREVIEW_SECONDS}s</button><button class="secondary" type="button" disabled={!midiPreviewPlaying} onclick={stopMidiPreview}>Stop preview</button><button class="secondary" type="button" onclick={exportMidi}>Export .mid</button></div></div><div class="roll-title"><span>PIANO ROLL · SYNTH PREVIEW</span><strong>{formatTime(midiWindowStart)} — {formatTime(Math.min(track.durationSeconds, midiWindowStart + MIDI_WINDOW_SECONDS))}</strong></div><div class="piano-roll" aria-label={`${windowNotes(amt.notes).length} MIDI notes visible`}>{#each windowNotes(amt.notes) as note}<span title={`MIDI ${note.midi} · velocity ${note.velocity}`} style={midiStyle(note)}></span>{/each}</div><label class="slider-label">Navigate MIDI<input type="range" min="0" max={Math.max(0, track.durationSeconds - MIDI_WINDOW_SECONDS)} step="0.25" bind:value={midiWindowStart} /></label><p class="detail">The preview is a local synthesized interpretation of the detected notes. Export MIDI to continue editing in a DAW.</p>{/if}{#if midiSavedAs}<p class="detail">Saved {midiSavedAs}.</p>{/if}{#if amtError}<p class="error">{amtError}</p>{/if}</section>
     {:else if activeTab === 'analysis'}
