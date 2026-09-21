@@ -8,4 +8,5 @@ pub mod pitch;
 pub mod rhythm;
 pub mod scheduler;
 pub mod separation;
+pub mod stems;
 pub mod supervisor;

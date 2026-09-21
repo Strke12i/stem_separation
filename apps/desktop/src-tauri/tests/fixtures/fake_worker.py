@@ -74,6 +74,13 @@ def respond_amt(request: dict[str, object]) -> None:
     emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"engine": "basic-pitch", "model": "icassp_2022", "relative_midi_path": "transcription.mid", "notes": [{"start": 0.0, "end": 1.0, "midi": 60, "velocity": 90}]}})
 
 
+def respond_harmony(request: dict[str, object]) -> None:
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "event", "job_id": request["job_id"], "event": "progress", "data": {"stage": "extracting_chroma", "percent": 0.3}})
+    key = {"tonic": "A", "mode": "minor", "label": "A minor", "score": 0.8, "second_best": "C major", "margin": 0.1}
+    chords = [{"start": 0.0, "end": 2.0, "label": "Am", "root": "A", "quality": "minor", "score": 0.9, "beat_aligned": False}]
+    emit({"protocol_version": PROTOCOL_VERSION, "type": "response", "request_id": request["request_id"], "job_id": request["job_id"], "ok": True, "result": {"key": key, "chords": chords, "algorithm": "librosa.chroma_cqt+templates"}})
+
+
 def respond_pitch(request: dict[str, object]) -> None:
     params = request["params"]
     stem = params.get("stem") if isinstance(params, dict) else "bass"
@@ -126,6 +133,8 @@ def main() -> None:
             respond_separation(request)
         elif mode == "rhythm" and request.get("method") == "analyze_rhythm":
             respond_rhythm(request)
+        elif mode == "harmony" and request.get("method") == "analyze_harmony":
+            respond_harmony(request)
         elif mode == "pitch" and request.get("method") == "analyze_pitch":
             respond_pitch(request)
         elif mode in {"amt", "amt_bad_midi"} and request.get("method") == "transcribe":

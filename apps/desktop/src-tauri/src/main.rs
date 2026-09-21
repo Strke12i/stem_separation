@@ -269,11 +269,12 @@ async fn cached_rhythm(
 #[tauri::command]
 async fn analyze_harmony(
     track_id: String,
+    stem: Option<String>,
     harmony: tauri::State<'_, Arc<HarmonyService>>,
     library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<HarmonyReport, String> {
     let result = Arc::clone(harmony.inner())
-        .analyze(track_id.clone())
+        .analyze(track_id.clone(), stem)
         .await
         .map_err(|error| error.to_string())?;
     if let Err(error) = library.refresh(&track_id) {
@@ -285,10 +286,16 @@ async fn analyze_harmony(
 #[tauri::command]
 async fn cached_harmony(
     track_id: String,
+    stem: Option<String>,
     harmony: tauri::State<'_, Arc<HarmonyService>>,
 ) -> Result<Option<HarmonyReport>, String> {
     let harmony = Arc::clone(harmony.inner());
-    blocking(move || harmony.cached(&track_id).map_err(|error| error.to_string())).await
+    blocking(move || {
+        harmony
+            .cached(&track_id, stem.as_deref())
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -326,11 +333,12 @@ async fn cached_pitch(
 #[tauri::command]
 async fn transcribe_track(
     track_id: String,
+    stem: Option<String>,
     amt: tauri::State<'_, Arc<AmtService>>,
     library: tauri::State<'_, Arc<LibraryService>>,
 ) -> Result<AmtReport, String> {
     let result = Arc::clone(amt.inner())
-        .transcribe(track_id.clone())
+        .transcribe(track_id.clone(), stem)
         .await
         .map_err(|error| error.to_string())?;
     if let Err(error) = library.refresh(&track_id) {
@@ -342,15 +350,21 @@ async fn transcribe_track(
 #[tauri::command]
 async fn cached_amt(
     track_id: String,
+    stem: Option<String>,
     amt: tauri::State<'_, Arc<AmtService>>,
 ) -> Result<Option<AmtReport>, String> {
     let amt = Arc::clone(amt.inner());
-    blocking(move || amt.cached(&track_id).map_err(|error| error.to_string())).await
+    blocking(move || {
+        amt.cached(&track_id, stem.as_deref())
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn save_amt_midi(
     track_id: String,
+    stem: Option<String>,
     suggested_name: String,
     amt: tauri::State<'_, Arc<AmtService>>,
 ) -> Result<Option<String>, String> {
@@ -361,7 +375,7 @@ async fn save_amt_midi(
     // before the user is asked where to save.
     tauri::async_runtime::spawn_blocking(move || {
         let bytes = amt
-            .midi_bytes(&track_id)
+            .midi_bytes(&track_id, stem.as_deref())
             .map_err(|error| error.to_string())?;
         let file_name = std::path::Path::new(&suggested_name)
             .file_name()

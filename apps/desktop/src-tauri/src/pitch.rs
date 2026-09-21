@@ -2,6 +2,7 @@
 
 use crate::doctor::WorkerManager;
 use crate::ingest::IngestService;
+use crate::stems::{StemLookupError, stem_audio};
 use analyzer_domain::{
     Artifact, ArtifactKind, CreatedBy, JobId, JobStatus, StageRecord, TrackManifest,
 };
@@ -9,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -161,31 +162,10 @@ fn stem_path(
     manifest: &TrackManifest,
     stem: &str,
 ) -> Result<(PathBuf, String), PitchError> {
-    let artifact = manifest
-        .artifacts
-        .iter()
-        .rev()
-        .find(|artifact| {
-            artifact.kind == ArtifactKind::Stem
-                && artifact
-                    .stem
-                    .as_ref()
-                    .is_some_and(|kind| kind.name() == stem)
-        })
-        .ok_or_else(|| PitchError::MissingStem(stem.to_owned()))?;
-    let relative = Path::new(&artifact.relative_path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(PitchError::MissingStem(stem.to_owned()));
-    }
-    let input = workspace.join(relative).canonicalize()?;
-    if !input.starts_with(workspace) || !is_wav(&input)? {
-        return Err(PitchError::MissingStem(stem.to_owned()));
-    }
-    Ok((input, artifact.sha256.clone()))
+    stem_audio(workspace, manifest, stem).map_err(|error| match error {
+        StemLookupError::Missing(stem) => PitchError::MissingStem(stem),
+        StemLookupError::Io(error) => PitchError::Storage(error),
+    })
 }
 
 fn cache_key(source_hash: &str, stem: &str, stem_hash: &str) -> String {
@@ -283,15 +263,6 @@ async fn persist(
         warnings: Vec::new(),
     });
     write_json(&workspace.join("manifest.json"), &manifest)
-}
-
-fn is_wav(path: &Path) -> Result<bool, PitchError> {
-    let mut header = [0_u8; 12];
-    let mut file = fs::File::open(path)?;
-    if file.read_exact(&mut header).is_err() {
-        return Ok(false);
-    }
-    Ok(&header[..4] == b"RIFF" && &header[8..12] == b"WAVE")
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), PitchError> {
