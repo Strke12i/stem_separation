@@ -107,6 +107,17 @@ pub struct IngestedTrack {
     pub sample_rate: u32,
     pub channels: u16,
     pub workspace_path: String,
+    /// True when this audio had been imported before and its saved work
+    /// (stems, analyses) was kept instead of starting a new track.
+    pub reused: bool,
+}
+
+/// A track already in the workspace, read from its manifest.
+#[derive(Clone, Debug)]
+pub struct KnownTrack {
+    pub track_id: String,
+    pub workspace: PathBuf,
+    pub manifest: TrackManifest,
 }
 
 #[derive(Debug, Error)]
@@ -181,8 +192,22 @@ impl IngestService {
 
     pub fn import(&self, selected_path: &Path) -> Result<IngestedTrack, IngestError> {
         let source_path = validate_source(selected_path)?;
-        let source_metadata = probe_audio(&self.tools, &source_path)?;
         let source_hash = sha256_file(&source_path)?;
+        // The same audio always maps to the same track: importing it again
+        // must not throw away stems that took minutes of CPU to separate.
+        if let Some(known) = self.tracks_with_source(&source_hash).into_iter().next() {
+            info!(track_id = %known.track_id, "audio already imported; reusing its workspace");
+            return Ok(IngestedTrack {
+                track_id: known.track_id,
+                original_name: known.manifest.source.original_name,
+                duration_seconds: known.manifest.source.duration_seconds,
+                sample_rate: known.manifest.source.sample_rate,
+                channels: known.manifest.source.channels,
+                workspace_path: known.workspace.to_string_lossy().into_owned(),
+                reused: true,
+            });
+        }
+        let source_metadata = probe_audio(&self.tools, &source_path)?;
         let track_id = TrackId::new();
         let original_name = source_path
             .file_name()
@@ -227,7 +252,55 @@ impl IngestService {
             sample_rate: source_metadata.sample_rate,
             channels: source_metadata.channels,
             workspace_path: final_root.to_string_lossy().into_owned(),
+            reused: false,
         })
+    }
+
+    /// Every usable track imported from exactly this audio, most worked-on first.
+    ///
+    /// Older versions created a new track on every import, so the same song
+    /// can be present several times. Ordering puts a track that holds saved
+    /// stems first, then the one with the most registered artifacts, then the
+    /// earliest import, so callers reuse the track with the most to keep.
+    #[must_use]
+    pub fn tracks_with_source(&self, sha256: &str) -> Vec<KnownTrack> {
+        let Ok(entries) = fs::read_dir(&self.workspace_root) else {
+            return Vec::new();
+        };
+        let mut found: Vec<((bool, usize), String, KnownTrack)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let workspace = entry.path();
+                let name = entry.file_name().into_string().ok()?;
+                let manifest: TrackManifest =
+                    serde_json::from_slice(&fs::read(workspace.join(MANIFEST_NAME)).ok()?).ok()?;
+                // A directory whose name and manifest disagree, or whose audio
+                // is gone, is not a track another import can safely become.
+                let usable = name.starts_with("track-")
+                    && manifest.track_id.as_str() == name
+                    && manifest.source.sha256 == sha256
+                    && workspace.join(NORMALIZED_RELATIVE_PATH).is_file();
+                usable.then(|| {
+                    let started = manifest
+                        .stages
+                        .first()
+                        .map(|stage| stage.started_at.clone())
+                        .unwrap_or_default();
+                    let work = (has_saved_stems(&workspace), manifest.artifacts.len());
+                    (
+                        work,
+                        started,
+                        KnownTrack {
+                            track_id: name,
+                            workspace,
+                            manifest,
+                        },
+                    )
+                })
+            })
+            .collect();
+        found.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        found.into_iter().map(|(_, _, known)| known).collect()
     }
 
     /// Removes only abandoned, directory-shaped job staging areas older than one day.
@@ -442,6 +515,19 @@ impl IngestService {
         };
         write_json_atomically(&staging_root.join(MANIFEST_NAME), &manifest)
     }
+}
+
+/// Whether any separation model has written a stem set into this workspace.
+fn has_saved_stems(workspace: &Path) -> bool {
+    let Ok(models) = fs::read_dir(workspace.join("stems")) else {
+        return false;
+    };
+    models.flatten().any(|model| {
+        fs::read_dir(model.path()).is_ok_and(|sets| {
+            sets.flatten()
+                .any(|set| set.path().join("separation.json").is_file())
+        })
+    })
 }
 
 fn default_workspace_root() -> PathBuf {
