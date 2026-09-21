@@ -165,6 +165,27 @@ A chave da mix é a mesma de antes do suporte a stems. Nomes de stem são valida
 contra a lista fixa (`vocals`, `drums`, `bass`, `other`, `guitar`, `piano`) antes de
 virarem parte de um path.
 
+## Reuso por conteúdo do áudio
+
+`source.sha256` identifica a música. Três regras mantêm o trabalho já feito:
+
+- **Importação:** se algum track do workspace tem o mesmo `source.sha256` (e o seu
+  `normalized/source.wav` existe), `import` devolve esse track com `reused: true`, sem
+  criar outro. Havendo duplicatas de versões antigas, vale a que guarda stems
+  separados, depois a com mais artefatos, depois a mais antiga.
+- **Adoção:** a chave de cache dos stems (`stems/<modelo>/<chave>/`) depende só do
+  checksum do áudio, do motor e do modelo, não do track. Se o track não tem o
+  conjunto mas outro track da mesma música tem, os `.wav` são ligados por hard link
+  (ou copiados, se o sistema de arquivos não permitir) para o workspace do track pelo
+  mesmo caminho de promoção da separação, e registrados no manifest. Stems promovidos
+  nunca são modificados, então o compartilhamento é seguro.
+- **Reparo:** um conjunto válido no disco que o manifest não lista (atualização
+  perdida, ou queda entre promoção e registro) é registrado de novo. Sem a entrada no
+  manifest o mixer não consegue carregar os stems.
+
+Nada disso exige o modelo instalado, a fila de separação ou a verificação de
+checksum do bundle. Duplicatas antigas não são apagadas automaticamente.
+
 ## Paths
 
 Persistência usa path relativo ao track workspace.

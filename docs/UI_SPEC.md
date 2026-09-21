@@ -34,6 +34,14 @@ A aba Library é a primeira aba e a única acessível sem track carregada. Reabr
 track recarrega o áudio e as análises em cache pelos mesmos comandos de sempre; a UI
 só conhece `trackId`, nunca paths.
 
+Importar um áudio que já está na biblioteca (mesmo checksum) não cria um track novo:
+Rust devolve o existente com `reused: true` e a UI avisa que os stems e as análises
+salvos foram reaproveitados. Ao abrir ou importar um track, a UI consulta
+`cached_separation`; se já houver stems (do próprio track ou de outra importação da
+mesma música), a aba Stems mostra "Using cached stems" com o botão "Open mixer" sem
+pedir nova separação. "Open mixer" fica desabilitado enquanto carrega e qualquer erro
+aparece na própria aba Stems.
+
 Ao selecionar:
 
 - Rust abre dialog;

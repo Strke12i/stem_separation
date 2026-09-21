@@ -288,6 +288,10 @@ MVP:
 - manifests JSON;
 - filesystem.
 
+O checksum do áudio de origem identifica a música. Importar o mesmo arquivo de novo
+devolve o track existente, e stems já separados para o mesmo áudio, mesmo em outro
+track, são reaproveitados por hard link em vez de reprocessados (D-025).
+
 SQLite indexa a biblioteca (Fase 12), sem substituir os manifests:
 
 - `<workspace_root>/library/index.sqlite3` é um cache derivado e descartável,

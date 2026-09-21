@@ -216,3 +216,30 @@ bass e vocals; other, guitar e piano recebem Basic Pitch e acordes; drums não t
 pitch. O agrupamento em compassos é escolha do usuário porque downbeats e fórmula
 de compasso ainda não são detectados (Backlog). A lógica de tempo, grade e
 "o que soa agora" fica em `arrangement.ts`, pura e testada, separada do componente.
+
+## D-025 — Uma música é um track; stems são reaproveitados por conteúdo
+
+Status: accepted
+
+Cada importação criava um `track-<uuid>` novo, então o cache de stems, que vive no
+workspace do track, nunca acertava entre importações e a mesma música era
+separada de novo (cerca de 9 minutos de CPU cada vez, com 180 MB de stems por cópia).
+A identidade passa a ser o checksum do áudio de origem: importar de novo devolve o
+track existente, e stems já separados para o mesmo áudio são adotados por hard link
+(com cópia como plano B) pelo caminho normal de promoção, com validação do WAV e
+registro no manifest sob o lock do track. Um conjunto no disco que o manifest não
+lista é registrado de novo em vez de tratado como cache válido e depois impossível de
+abrir. A checagem do cache acontece antes da fila, do modelo instalado e do checksum
+do bundle: stems que já existem não dependem de nada disso. Consequência aceita:
+duplicatas antigas continuam na biblioteca até o usuário removê-las; o sistema só
+deixa de criar novas e de reprocessar por causa delas.
+
+## D-026 — Dependências otimizadas também no perfil dev
+
+Status: accepted
+
+Medido (D-019/D-022): preparar o mix de 4 stems de 4:17 no build dev levava 5,0 s por
+causa da decodificação em `opt-level 0`, sem nenhum indicador na UI. Com
+`[profile.dev.package."*"] opt-level = 3` leva 0,76 s. Só as dependências mudam; o
+código do projeto continua depurável. O custo é uma primeira compilação mais longa.
+

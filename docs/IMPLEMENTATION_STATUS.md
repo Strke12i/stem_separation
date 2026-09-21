@@ -498,3 +498,39 @@ Fix: Sem `LOCAL_MUSIC_ANALYZER_WORKSPACE`, o host usa
 workspace continua configurável pela variável de ambiente.
 Validation: Teste unitário garante que o padrão não aponta para a árvore do
 repositório; testes Rust, clippy, svelte-check e build passaram.
+
+### Correção — Stems já separados são reaproveitados, e o mixer abre nos casos que falhavam
+
+Date: 2026-09-21
+Cause: Reproduzida no app Tauri real (WebView2 dirigido por depuração remota, com o
+workspace do usuário). (1) Cada importação criava um track novo, então a mesma música
+(13 importações do mesmo arquivo no workspace, 4 com cópias completas de stems, ~880 MB
+duplicados) era separada de novo a cada vez. (2) Dois desses tracks tinham stems no disco
+mas o manifest não os listava (provavelmente a corrida de escrita corrigida em 3d0a201: esses tracks são de 07/09):
+"Separate" respondia cache hit e "Open mixer" falhava com "A generated stem failed local
+validation: vocals", erro que a aba Stems não mostrava. (3) A checagem do cache só
+acontecia depois de exigir o modelo instalado e de gastar ~3 s conferindo o checksum do
+bundle. (4) "Open mixer" levava 5 s no build dev sem nenhum indicador.
+Fix: `IngestService::import` devolve o track existente do mesmo checksum
+(`reused: true`); `SeparationService` reaproveita, antes da fila e do modelo, stems do
+próprio track, de outra importação da mesma música (hard link, cópia como plano B) ou
+os que estavam órfãos no disco (registro no manifest); novo comando `cached_separation`
+faz a UI mostrar "Using cached stems" ao abrir o track. "Open mixer" mostra progresso e
+seus erros aparecem na aba Stems. Dependências passam a compilar com `opt-level = 3` no
+perfil dev (5,0 s → 0,76 s para preparar o mix, medido).
+Decisions: D-025, D-026.
+Tests: Rust: importar o mesmo áudio reaproveita o track e o trabalho salvo, áudio
+diferente cria outro, escolha da duplicata com stems, diretório sem áudio normalizado não
+é reaproveitado; separação registra de novo stems órfãos, reaproveita stems de outro
+track da mesma música sem modelo nem worker, e não reaproveita os de outra música. Os
+testes foram verificados por mutação (reparo, adoção, ranking, checksum e checagem do
+áudio desligados, um por vez).
+Validation: No app real, um track com stems órfãos e um nunca separado abriram o mixer a
+partir do cache e tocaram, com a posição avançando; clique, arraste, teclado e botões do
+transporte posicionaram com exatidão (5,21 s esperado, 5,21 s obtido). O hard link foi
+confirmado no disco (2 links, sem duplicar os 180 MB).
+Known limitations: O diálogo nativo de importação não foi acionado no app real (só os
+testes com ffprobe/ffmpeg de mentira cobrem o caminho de `import`). Nenhum áudio foi
+ouvido: só o estado do motor (tocando, posição avançando, sem erro de dispositivo).
+Duplicatas antigas seguem na biblioteca; nenhuma é removida automaticamente.
+
