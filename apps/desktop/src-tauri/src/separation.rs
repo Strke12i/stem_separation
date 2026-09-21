@@ -21,6 +21,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex, Notify};
+use tracing::{info, warn};
 
 const MODEL_FOUR: &str = "demucs-4";
 const MODEL_SIX: &str = "demucs-6-experimental";
@@ -223,6 +224,19 @@ impl SeparationService {
         track_id: String,
         model_id: String,
     ) -> Result<SeparationReport, SeparationError> {
+        let descriptor = descriptor(&model_id).ok_or(SeparationError::UnknownModel)?;
+        let workspace = self
+            .ingest
+            .workspace_for(&track_id)
+            .map_err(|error| SeparationError::Worker(error.to_string()))?;
+        // Stems that already exist are used as they are: no queue, no model
+        // install and no checksum pass over the model weights.
+        if self
+            .reuse_saved_stems(&track_id, &workspace, descriptor)
+            .await
+        {
+            return Ok(cache_hit_report(&track_id, &model_id, descriptor));
+        }
         let pending = PendingGuard::enter(&self.pending, &track_id, &model_id);
         // Waiting behind another separation must stay cancellable.
         let _guard = tokio::select! {
@@ -230,11 +244,13 @@ impl SeparationService {
             () = self.wait_pending_cancelled(&track_id) => return Err(SeparationError::Cancelled),
         };
         pending.set_stage("Preparing local workspace");
-        let descriptor = descriptor(&model_id).ok_or(SeparationError::UnknownModel)?;
-        let workspace = self
-            .ingest
-            .workspace_for(&track_id)
-            .map_err(|error| SeparationError::Worker(error.to_string()))?;
+        // The separation this request queued behind may have produced them.
+        if self
+            .reuse_saved_stems(&track_id, &workspace, descriptor)
+            .await
+        {
+            return Ok(cache_hit_report(&track_id, &model_id, descriptor));
+        }
         let model_dir = workspace
             .parent()
             .unwrap_or(&workspace)
@@ -248,20 +264,6 @@ impl SeparationService {
         let manifest = read_manifest(&workspace)?;
         let cache_key = cache_key(&manifest.source.sha256, descriptor);
         let final_dir = workspace.join("stems").join(descriptor.id).join(&cache_key);
-        if cached_stems_are_valid(&final_dir, descriptor)? {
-            return Ok(SeparationReport {
-                job_id: "cache-hit".to_owned(),
-                track_id,
-                model_id,
-                cache_hit: true,
-                stems: descriptor
-                    .stems
-                    .iter()
-                    .map(|stem| stem.name().to_owned())
-                    .collect(),
-                progress_events: 0,
-            });
-        }
 
         let job_id = JobId::new();
         if pending.leave() {
@@ -380,6 +382,87 @@ impl SeparationService {
                 .collect(),
             progress_events: events.len(),
         })
+    }
+
+    /// The stems already saved for this track, if any, without running a model.
+    ///
+    /// This is the same reuse `separate` performs, so opening a track can show
+    /// that its stems are ready instead of offering to separate it again.
+    pub async fn cached_separation(
+        &self,
+        track_id: &str,
+        model_id: &str,
+    ) -> Result<Option<SeparationReport>, SeparationError> {
+        let descriptor = descriptor(model_id).ok_or(SeparationError::UnknownModel)?;
+        let workspace = self
+            .ingest
+            .workspace_for(track_id)
+            .map_err(|error| SeparationError::Worker(error.to_string()))?;
+        Ok(self
+            .reuse_saved_stems(track_id, &workspace, descriptor)
+            .await
+            .then(|| cache_hit_report(track_id, model_id, descriptor)))
+    }
+
+    /// True once a complete, registered stem set exists for this track. A
+    /// failure to reuse is not fatal: the caller falls back to separating.
+    async fn reuse_saved_stems(
+        &self,
+        track_id: &str,
+        workspace: &Path,
+        descriptor: &'static ModelDescriptor,
+    ) -> bool {
+        match self.resolve_cached(track_id, workspace, descriptor).await {
+            Ok(reused) => reused,
+            Err(error) => {
+                warn!(%error, %track_id, "could not reuse saved stems; separating instead");
+                false
+            }
+        }
+    }
+
+    /// Makes a stem set this track already has, or that another import of the
+    /// same audio produced, usable without running the model.
+    ///
+    /// Stems are keyed by the audio's checksum, not by track, so a copy made
+    /// for another track is byte-for-byte what this one would compute. Stems
+    /// found on disk but missing from the manifest (a lost update, or a crash
+    /// between promotion and registration) are registered again: without the
+    /// manifest entry the mixer cannot load them.
+    async fn resolve_cached(
+        &self,
+        track_id: &str,
+        workspace: &Path,
+        descriptor: &'static ModelDescriptor,
+    ) -> Result<bool, SeparationError> {
+        let manifest = read_manifest(workspace)?;
+        let key = cache_key(&manifest.source.sha256, descriptor);
+        let final_dir = workspace.join("stems").join(descriptor.id).join(&key);
+        if !cached_stems_are_valid(&final_dir, descriptor)? {
+            let donor = self
+                .ingest
+                .tracks_with_source(&manifest.source.sha256)
+                .into_iter()
+                .filter(|known| known.track_id != track_id)
+                .map(|known| known.workspace.join("stems").join(descriptor.id).join(&key))
+                .find(|directory| cached_stems_are_valid(directory, descriptor).unwrap_or(false));
+            let Some(donor) = donor else {
+                return Ok(false);
+            };
+            info!(%track_id, from = %donor.display(), "reusing stems separated for the same audio");
+            let workspace = workspace.to_owned();
+            let target = final_dir.clone();
+            let key = key.clone();
+            tokio::task::spawn_blocking(move || {
+                adopt(&donor, &workspace, &target, &key, descriptor)
+            })
+            .await
+            .map_err(|error| SeparationError::InvalidStem(error.to_string()))??;
+        }
+        if !stems_are_registered(&manifest, descriptor, &key) {
+            persist_artifacts(&self.ingest, track_id, workspace, descriptor, &key).await?;
+        }
+        Ok(true)
     }
 
     pub fn stem_files(
@@ -690,6 +773,74 @@ fn cache_key(source_hash: &str, descriptor: &ModelDescriptor) -> String {
     .chars()
     .take(24)
     .collect()
+}
+
+fn cache_hit_report(
+    track_id: &str,
+    model_id: &str,
+    descriptor: &ModelDescriptor,
+) -> SeparationReport {
+    SeparationReport {
+        job_id: "cache-hit".to_owned(),
+        track_id: track_id.to_owned(),
+        model_id: model_id.to_owned(),
+        cache_hit: true,
+        stems: descriptor
+            .stems
+            .iter()
+            .map(|stem| stem.name().to_owned())
+            .collect(),
+        progress_events: 0,
+    }
+}
+
+/// Whether the manifest lists exactly this stem set, at this cache key's paths.
+fn stems_are_registered(
+    manifest: &TrackManifest,
+    descriptor: &ModelDescriptor,
+    cache_key: &str,
+) -> bool {
+    let of_model = |artifact: &&Artifact| {
+        artifact.kind == ArtifactKind::Stem
+            && artifact.created_by.model.as_deref() == Some(descriptor.id)
+    };
+    manifest.artifacts.iter().filter(of_model).count() == descriptor.stems.len()
+        && descriptor.stems.iter().all(|stem| {
+            let relative = format!("stems/{}/{}/{}.wav", descriptor.id, cache_key, stem.name());
+            manifest.artifacts.iter().filter(of_model).any(|artifact| {
+                artifact.stem.as_ref() == Some(stem) && artifact.relative_path == relative
+            })
+        })
+}
+
+/// Places another track's stem set in this workspace through the normal
+/// promotion path. Promoted stems are never modified, so a hard link shares
+/// the bytes at no cost; the files are copied where linking is unavailable.
+fn adopt(
+    donor: &Path,
+    workspace: &Path,
+    final_dir: &Path,
+    cache_key: &str,
+    descriptor: &ModelDescriptor,
+) -> Result<(), SeparationError> {
+    let temporary = workspace
+        .join("tmp")
+        .join(format!("adopt-{}", JobId::new().as_str()));
+    fs::create_dir_all(&temporary)?;
+    let placed = descriptor
+        .stems
+        .iter()
+        .try_for_each(|stem| {
+            let name = format!("{}.wav", stem.name());
+            let (from, to) = (donor.join(&name), temporary.join(&name));
+            fs::hard_link(&from, &to).or_else(|_| fs::copy(&from, &to).map(|_| ()))
+        })
+        .map_err(SeparationError::from)
+        .and_then(|()| promote(&temporary, final_dir, cache_key, descriptor));
+    if placed.is_err() {
+        cleanup_temporary_job(&temporary);
+    }
+    placed
 }
 
 fn read_manifest(workspace: &Path) -> Result<TrackManifest, SeparationError> {

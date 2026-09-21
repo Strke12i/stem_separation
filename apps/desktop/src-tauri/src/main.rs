@@ -226,6 +226,25 @@ async fn separate_track(
 }
 
 #[tauri::command]
+async fn cached_separation(
+    track_id: String,
+    model_id: String,
+    separation: tauri::State<'_, Arc<SeparationService>>,
+    library: tauri::State<'_, Arc<LibraryService>>,
+) -> Result<Option<SeparationReport>, String> {
+    let cached = separation
+        .cached_separation(&track_id, &model_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if cached.is_some() {
+        if let Err(error) = library.refresh(&track_id) {
+            tracing::warn!(%error, "could not refresh the library index after reusing stems");
+        }
+    }
+    Ok(cached)
+}
+
+#[tauri::command]
 async fn cancel_separation(
     track_id: String,
     separation: tauri::State<'_, Arc<SeparationService>>,
@@ -573,6 +592,7 @@ fn main() {
             reopen_audio_device,
             separation_models,
             separate_track,
+            cached_separation,
             cancel_separation,
             separation_status,
             analyze_rhythm,

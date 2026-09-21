@@ -7,7 +7,7 @@ use local_music_analyzer_desktop::supervisor::WorkerLaunch;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -26,8 +26,9 @@ fn wav() -> Vec<u8> {
     bytes
 }
 
-fn prepare_workspace(temp: &TempDir) -> (Arc<IngestService>, String) {
-    let root = temp.path().join("workspace");
+/// A track whose audio has the given checksum; two tracks with the same
+/// checksum are the same song imported twice.
+fn add_track(root: &Path, source_hash: &str) -> String {
     let track_id = TrackId::new();
     let workspace = root.join(track_id.as_str());
     fs::create_dir_all(workspace.join("normalized")).unwrap();
@@ -36,7 +37,7 @@ fn prepare_workspace(temp: &TempDir) -> (Arc<IngestService>, String) {
         schema_version: 1,
         track_id: track_id.clone(),
         source: SourceMetadata {
-            sha256: "source-hash".to_owned(),
+            sha256: source_hash.to_owned(),
             original_name: "source.wav".to_owned(),
             duration_seconds: 1.0,
             sample_rate: 44_100,
@@ -47,7 +48,7 @@ fn prepare_workspace(temp: &TempDir) -> (Arc<IngestService>, String) {
             artifact_id: "normalized".to_owned(),
             kind: ArtifactKind::NormalizedSource,
             relative_path: "normalized/source.wav".to_owned(),
-            sha256: "source-hash".to_owned(),
+            sha256: source_hash.to_owned(),
             stem: None,
             created_by: CreatedBy {
                 stage: "normalize".to_owned(),
@@ -64,6 +65,12 @@ fn prepare_workspace(temp: &TempDir) -> (Arc<IngestService>, String) {
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
+    track_id.to_string()
+}
+
+fn prepare_workspace(temp: &TempDir) -> (Arc<IngestService>, String) {
+    let root = temp.path().join("workspace");
+    let track_id = add_track(&root, "source-hash");
     let model = root.join("models/demucs-4");
     fs::create_dir_all(&model).unwrap();
     fs::write(model.join("htdemucs.yaml"), "fixture").unwrap();
@@ -82,7 +89,7 @@ fn prepare_workspace(temp: &TempDir) -> (Arc<IngestService>, String) {
     .unwrap();
     (
         Arc::new(IngestService::new(root, MediaTools::development())),
-        track_id.to_string(),
+        track_id,
     )
 }
 
@@ -347,4 +354,130 @@ async fn rejects_a_model_bundle_whose_checksum_no_longer_matches() {
     assert!(error.to_string().contains("checksum"));
     // No separation attempt should have run against the tampered bundle.
     assert!(!workspace.join("stems/demucs-4").exists());
+}
+
+fn separation_service(ingest: &Arc<IngestService>, mode: &str) -> SeparationService {
+    let mut launch = WorkerLaunch::new(
+        python(),
+        vec![fixture().into_os_string(), mode.into()],
+        Duration::from_secs(1),
+    );
+    launch.request_timeout = Duration::from_secs(1);
+    SeparationService::new(
+        Arc::clone(ingest),
+        Arc::new(WorkerManager::new(launch)),
+        Arc::new(ResourceScheduler::new()),
+    )
+}
+
+fn registered_stems(ingest: &IngestService, track_id: &str) -> Vec<String> {
+    let workspace = ingest.workspace_for(track_id).unwrap();
+    let manifest: TrackManifest =
+        serde_json::from_slice(&fs::read(workspace.join("manifest.json")).unwrap()).unwrap();
+    manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == ArtifactKind::Stem)
+        .map(|artifact| artifact.relative_path.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn stems_on_disk_but_missing_from_the_manifest_are_registered_again() {
+    // A lost manifest update once left separated stems on disk that the mixer
+    // could not load: separation reported a cache hit, then opening failed.
+    let temp = TempDir::new().unwrap();
+    let (ingest, track_id) = prepare_workspace(&temp);
+    let service = separation_service(&ingest, "separate");
+    service
+        .separate(track_id.clone(), "demucs-4".to_owned())
+        .await
+        .unwrap();
+
+    let workspace = ingest.workspace_for(&track_id).unwrap();
+    let mut manifest: TrackManifest =
+        serde_json::from_slice(&fs::read(workspace.join("manifest.json")).unwrap()).unwrap();
+    manifest
+        .artifacts
+        .retain(|artifact| artifact.kind != ArtifactKind::Stem);
+    manifest.stages.clear();
+    fs::write(
+        workspace.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(service.stem_files(&track_id, "demucs-4").is_err());
+
+    let report = service
+        .separate(track_id.clone(), "demucs-4".to_owned())
+        .await
+        .unwrap();
+    assert!(report.cache_hit);
+    assert_eq!(service.stem_files(&track_id, "demucs-4").unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn a_track_of_the_same_audio_reuses_stems_without_the_model_or_the_worker() {
+    let temp = TempDir::new().unwrap();
+    let (ingest, first) = prepare_workspace(&temp);
+    let service = separation_service(&ingest, "separate");
+    service
+        .separate(first.clone(), "demucs-4".to_owned())
+        .await
+        .unwrap();
+
+    let second = add_track(ingest.workspace_root(), "source-hash");
+    fs::remove_dir_all(ingest.models_root()).unwrap();
+    // A worker that never starts: any attempt to run the model instead of
+    // reusing the first track's stems would fail here.
+    let service = separation_service(&ingest, "exit_before_hello");
+    assert_eq!(
+        service
+            .cached_separation(&second, "demucs-4")
+            .await
+            .unwrap()
+            .map(|report| report.cache_hit),
+        Some(true)
+    );
+    let report = service
+        .separate(second.clone(), "demucs-4".to_owned())
+        .await
+        .unwrap();
+    assert!(report.cache_hit);
+    assert_eq!(report.job_id, "cache-hit");
+
+    let files = service.stem_files(&second, "demucs-4").unwrap();
+    assert_eq!(files.len(), 4);
+    let workspace = ingest.workspace_for(&second).unwrap();
+    assert!(files.iter().all(|file| file.path.starts_with(&workspace)));
+    assert_eq!(registered_stems(&ingest, &second).len(), 4);
+    // The first track keeps working on its own copy.
+    assert_eq!(service.stem_files(&first, "demucs-4").unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn stems_of_a_different_song_are_never_reused() {
+    let temp = TempDir::new().unwrap();
+    let (ingest, first) = prepare_workspace(&temp);
+    let service = separation_service(&ingest, "separate");
+    service
+        .separate(first, "demucs-4".to_owned())
+        .await
+        .unwrap();
+
+    let other = add_track(ingest.workspace_root(), "another-song");
+    assert!(
+        service
+            .cached_separation(&other, "demucs-4")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(registered_stems(&ingest, &other).is_empty());
+    fs::remove_dir_all(ingest.models_root()).unwrap();
+    let error = service
+        .separate(other, "demucs-4".to_owned())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not installed"));
 }
