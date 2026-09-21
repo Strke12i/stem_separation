@@ -120,6 +120,39 @@ Cada alteração chama Rust.
 
 UI pode usar optimistic visuals apenas se reconcile com state do host.
 
+### Arranjo (timeline por stem)
+
+A aba Mixer é uma timeline estilo DAW, uma linha por stem num eixo de tempo
+compartilhado e com zoom:
+
+```text
+⏮ ⏪ ◀ ⏸ ⏹ ▶ ⏩   0:07.9 / 1:36.0  Bar 4 · 3  120.0 BPM     Beats/bar [4] Bar 1 on beat [1]  − ──○── + Fit  ☑ Follow  [Analyze all lanes]
+            ┌ 1 ┬ 2 ┬ 3 ┬ 4 ┬ 5 ┬ 6 ┬ …            régua: compassos e batidas
+Mix chords  │Am │F  │C  │G  │Am │…                 acordes da mix
+● Vocals MS │ waveform + notas (piano roll da faixa)
+● Drums  MS │ waveform  (percussão: sem pitch)
+● Bass   MS │ waveform + notas (pYIN)
+● Other  MS │ faixa de acordes + waveform + notas (Basic Pitch)
+```
+
+- A grade vem das batidas detectadas. Downbeats não são detectados, então o
+  agrupamento (batidas por compasso e em qual batida começa o compasso 1) é
+  escolha do usuário; padrão 4/4. Sem análise de ritmo a régua mostra segundos.
+- Cada faixa mostra o waveform do próprio stem, as notas detectadas nele (janela
+  de pitch própria da faixa) e, para stems harmônicos, uma faixa de acordes.
+  Notas e acordes sob o playhead são contornados e nomeados no cabeçalho da faixa.
+- O que cada stem sabe detectar: vocals e bass → notas monofônicas (pYIN);
+  other, guitar e piano → notas polifônicas (Basic Pitch) e acordes; drums →
+  nada de pitch. Cada detecção pode ser pedida por faixa ou toda de uma vez.
+- Mouse: clicar ou arrastar em qualquer ponto move o playhead; Ctrl+roda dá zoom
+  no cursor; Fit mostra a música inteira; Follow mantém o playhead à vista.
+- Cabeçalhos mantêm mute, solo e volume. Selecionar uma faixa (clique nela) habilita
+  os atalhos M e S.
+
+Atalhos (com o foco na timeline): Espaço = play/pause; ←/→ = batida anterior/próxima
+(Shift = compasso); Home/End = início/fim; +/− = zoom; F = seguir playhead;
+M/S = mute/solo da faixa selecionada.
+
 ## Worker health
 
 Settings/diagnostics:
@@ -180,11 +213,6 @@ Rust pode throttle/coalesce position updates.
 - contrast;
 - não depender apenas de cor.
 
-## Shortcuts futuros
+## Shortcuts
 
-```text
-Space = play/pause
-M = mute selected
-S = solo selected
-Left/Right = seek
-```
+Implementados na timeline do Mixer (ver "Arranjo"): Space, M, S, Left/Right.

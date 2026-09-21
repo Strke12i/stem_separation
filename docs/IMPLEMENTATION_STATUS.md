@@ -397,6 +397,40 @@ exercitados no app Tauri em execução (janela nativa); a verificação foi por
 testes Rust/Python, `svelte-check`, `vite build` e clippy.
 Next: Backlog (loop A/B, metrônomo, time stretch...).
 
+### Arranjo — timeline por stem no Mixer
+
+Date: 2026-09-21
+Commit: 86e2235, f8f8a14, 64b0a90, ed0bd6e
+Rust changes: O engine guarda o waveform de cada stem (resolução ≈20 picos/s, até
+40.000) e o expõe por `stem_waveforms`; o snapshot de polling deixou de carregar o
+waveform (só as respostas de load o trazem). Novo módulo `stems` (`stem_audio`,
+`is_known_stem`) extraído do pitch. `HarmonyService` e `AmtService` aceitam `stem`
+opcional, com cache, persistência e MIDI próprios por stem (ver DATA_CONTRACTS); as
+chaves de cache da mix não mudaram. Comandos `analyze_harmony`, `cached_harmony`,
+`transcribe_track`, `cached_amt` e `save_amt_midi` ganharam o parâmetro opcional.
+Python changes: None.
+Frontend changes: Novo `Arrangement.svelte` (canvas virtualizado com overlay do que
+soa, régua de compassos, faixas com waveform/notas/acordes, playhead suave,
+transporte, zoom, follow, clique e arraste para posicionar, atalhos) e
+`arrangement.ts` (grade, tempo↔pixel, notas ativas, colunas de waveform).
+`App.svelte` carrega os waveforms e os caches ao abrir o mixer e orquestra "Analyze
+all lanes".
+Benchmarks: None.
+Tests: 26 testes vitest da lógica de arranjo (`npm test`); Rust: resolução e
+snapshot enxuto do engine, testes de integração de harmonia/AMT por stem (mix e stem
+coexistem, nome de stem inválido, stem ausente), estabilidade das chaves de cache.
+A UI foi dirigida em Chrome headless contra um backend Tauri simulado: layout em DPR
+1 e 2, clique e arraste, teclado, zoom, Fit, mute/solo e follow.
+Decisions: D-024.
+Known limitations: Não foi exercitado no app Tauri real nem com áudio e análises
+reais (só com dados sintéticos). Downbeats e fórmula de compasso não são detectados,
+então o agrupamento em compassos é manual (padrão 4/4). Acordes por stem vêm da
+análise de chroma/templates, limitada a tríades maiores e menores, e Basic Pitch por
+stem pode ser lento em CPU. Bateria não tem notas (só waveform). Sem exportar MIDI
+por faixa na UI (o comando `save_amt_midi` já aceita o stem).
+Next: Backlog (loop A/B, metrônomo, downbeats/fórmula de compasso, correção manual
+de acordes) ou validar o arranjo no app real.
+
 ### Ferramenta local de modelos — Demucs
 
 Date: 2026-09-06

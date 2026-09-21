@@ -200,3 +200,19 @@ não conta para o limite de reinícios automáticos. `restart_worker` cancela o 
 em andamento em vez de esperá-lo, e o "Check engine" responde "busy" enquanto um
 job usa o worker.
 
+
+
+## D-024 — Análise por stem reaproveita os workers; a UI de arranjo só apresenta
+
+Status: accepted
+
+Para mostrar notas e acordes por faixa, harmonia e Basic Pitch passaram a aceitar
+um stem opcional. Os workers Python não mudaram: eles já analisam qualquer arquivo
+do workspace que Rust indicar, e Rust continua dono de localizar o stem, da chave
+de cache e da persistência (D-001, invariantes de `ARCHITECTURE.md`). Resultados de
+stem vivem ao lado dos da mix, nunca no lugar deles. Que análise cabe a cada stem é
+regra da apresentação (`laneCapabilities`): pYIN só faz sentido monofônico, então
+bass e vocals; other, guitar e piano recebem Basic Pitch e acordes; drums não tem
+pitch. O agrupamento em compassos é escolha do usuário porque downbeats e fórmula
+de compasso ainda não são detectados (Backlog). A lógica de tempo, grade e
+"o que soa agora" fica em `arrangement.ts`, pura e testada, separada do componente.

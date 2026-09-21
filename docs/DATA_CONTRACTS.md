@@ -148,6 +148,23 @@ Tags são normalizadas (trim, minúsculas, espaços colapsados, 1 a 32 caractere
 caracteres de controle). Arquivo ausente ou ilegível equivale a "sem tags, nunca
 aberto". `LibraryEntry` devolvido à UI nunca carrega path.
 
+## Análises por stem
+
+Harmonia e transcrição Basic Pitch também rodam sobre um stem separado (o pitch
+monofônico já era por stem). O resultado nunca substitui o da mix:
+
+| Análise | Mix | Stem |
+| ------- | --- | ---- |
+| harmony | `analysis.harmony`, `analysis/harmony/<sig>/harmony.json`, stage `harmony` | `analysis.stem_harmony.<stem>`, `analysis/harmony/<stem>/<sig>/harmony.json`, stage `harmony:<stem>` |
+| amt | `analysis.amt`, `analysis/amt/<key>/`, stage `amt` | `analysis.stem_amt.<stem>`, `analysis/amt/<stem>/<key>/` (com `transcription.mid` próprio), stage `amt:<stem>` |
+| pitch | — | `analysis.pitch.<stem>`, stage `pitch:<stem>` |
+
+Os relatórios de stem carregam `stem`; o da mix não. A chave de cache do stem inclui
+o nome e o checksum do artefato do stem, então uma nova separação invalida o cache.
+A chave da mix é a mesma de antes do suporte a stems. Nomes de stem são validados
+contra a lista fixa (`vocals`, `drums`, `bass`, `other`, `guitar`, `piano`) antes de
+virarem parte de um path.
+
 ## Paths
 
 Persistência usa path relativo ao track workspace.
