@@ -1,6 +1,8 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount, tick } from 'svelte';
+  import Arrangement from './Arrangement.svelte';
+  import { laneCapabilities } from './arrangement';
 
   type ComponentStatus = { ok: boolean; detail: string };
   type DoctorReport = { desktopCore: ComponentStatus; analysisWorker: ComponentStatus; protocolVersion: number };
@@ -12,7 +14,10 @@
   type SeparationStatus = { jobId: string; modelId: string; stage: string; progress: number; elapsedSeconds: number; cancelRequested: boolean };
   type RhythmReport = { bpm: number; beatTimes: number[]; algorithm: string; stabilityScore: number; cacheHit: boolean };
   type HarmonyReport = { key: { label: string }; chords: { start: number; end: number; label: string }[]; algorithm: string; cacheHit: boolean };
-  type PitchReport = { stem: string; engine: string; notes: unknown[]; cacheHit: boolean };
+  type PitchNote = { start: number; end: number; midi: number; note: string; confidence: number };
+  type PitchReport = { stem: string; engine: string; notes: PitchNote[]; cacheHit: boolean };
+  type StemWaveform = { stem: string; waveform: { sampleWindows: number; min: number[]; max: number[] } };
+  type AnalyzeKind = 'rhythm' | 'mix-chords' | 'notes' | 'chords';
   type MidiNote = { start: number; end: number; midi: number; velocity: number };
   type AmtReport = { engine: string; model: string; notes: MidiNote[]; midiArtifact: string; cacheHit: boolean };
   type LibraryEntry = { trackId: string; originalName: string; durationSeconds: number; sampleRate: number; channels: number; sourceSha256: string; bpm: number | null; keyLabel: string | null; stemModels: string[]; analyzed: string[]; importedAt: string | null; lastOpenedAt: string | null; openCount: number; tags: string[] };
@@ -83,6 +88,12 @@
   let libraryBusy = false;
   let libraryTimer: ReturnType<typeof window.setTimeout> | undefined;
   let libraryTagDraft: Record<string, string> = {};
+  let stemWaveforms: StemWaveform[] = [];
+  let stemAmt: Record<string, AmtReport | undefined> = {};
+  let stemHarmony: Record<string, HarmonyReport | undefined> = {};
+  let laneBusy: Record<string, boolean | undefined> = {};
+  let laneErrors: Record<string, string | undefined> = {};
+  let laneBatch: { done: number; total: number } | undefined;
 
   onMount(() => {
     void runDoctor(); void loadModels();
@@ -113,6 +124,7 @@
   async function adoptTrack(next: Track): Promise<void> {
     stopMidiPreview(); track = next; activeTab = 'workspace'; midiWindowStart = 0; rhythm = undefined; harmony = undefined; pitch = {}; amt = undefined; midiSavedAs = undefined;
     separationResult = undefined; separating = undefined; separationStatus = undefined; separationError = undefined;
+    stemWaveforms = []; stemAmt = {}; stemHarmony = {}; laneBusy = {}; laneErrors = {}; laneBatch = undefined;
     await loadOriginal(next.trackId);
     await Promise.all([loadCachedRhythm(next.trackId), loadCachedHarmony(next.trackId), loadCachedPitch(next.trackId, 'bass'), loadCachedPitch(next.trackId, 'vocals'), loadCachedAmt(next.trackId)]);
   }
@@ -174,7 +186,7 @@
     finally { libraryBusy = false; }
   }
   async function loadOriginal(trackId: string): Promise<void> { try { audio = await invoke<AudioState>('load_original_track', { trackId }); audioError = undefined; await tick(); drawWaveform(); } catch (error) { audioError = String(error); } }
-  async function loadStemMix(modelId: string): Promise<void> { if (!track) return; try { audio = await invoke<AudioState>('load_stem_mix', { trackId: track.trackId, modelId }); audioError = undefined; selectTab('mixer'); await tick(); drawWaveform(); } catch (error) { audioError = String(error); } }
+  async function loadStemMix(modelId: string): Promise<void> { if (!track) return; try { audio = await invoke<AudioState>('load_stem_mix', { trackId: track.trackId, modelId }); audioError = undefined; selectTab('mixer'); await tick(); drawWaveform(); void loadArrangementData(); } catch (error) { audioError = String(error); } }
   async function audioCommand(command: string, args: Record<string, unknown> = {}): Promise<void> { try { audio = withWaveform(await invoke<AudioState>(command, args)); audioError = undefined; } catch (error) { audioError = String(error); } }
   function scheduleVolume(command: string, args: Record<string, unknown>): void { if (volumeTimer) window.clearTimeout(volumeTimer); volumeTimer = window.setTimeout(() => void audioCommand(command, args), 80); }
 
@@ -203,6 +215,71 @@
       if (accepted) { if (separationStatus) separationStatus = { ...separationStatus, cancelRequested: true }; }
       else separationError = 'The job has not started running yet; try cancelling again in a moment.';
     } catch (error) { separationError = String(error); }
+  }
+
+
+  // ---- Arrangement (mixer) data: per-stem waveforms, cached and on-demand analyses ----
+  async function loadCachedStemAmt(id: string, stem: string): Promise<void> {
+    try { const report = await invoke<AmtReport | null>('cached_amt', { trackId: id, stem }) ?? undefined; if (track?.trackId === id) stemAmt = { ...stemAmt, [stem]: report }; } catch { /* nothing cached yet */ }
+  }
+  async function loadCachedStemHarmony(id: string, stem: string): Promise<void> {
+    try { const report = await invoke<HarmonyReport | null>('cached_harmony', { trackId: id, stem }) ?? undefined; if (track?.trackId === id) stemHarmony = { ...stemHarmony, [stem]: report }; } catch { /* nothing cached yet */ }
+  }
+  async function loadArrangementData(): Promise<void> {
+    if (!track || !audio?.stemMix) return;
+    const trackId = track.trackId;
+    const stems = audio.stems.map((item) => item.stem);
+    try { const waveforms = await invoke<StemWaveform[]>('stem_waveforms'); if (track?.trackId === trackId) stemWaveforms = waveforms; } catch (error) { audioError = String(error); }
+    await Promise.all(stems.flatMap((stem) => {
+      const capabilities = laneCapabilities(stem);
+      return [
+        capabilities.notes === 'pitch' ? loadCachedPitch(trackId, stem) : capabilities.notes === 'amt' ? loadCachedStemAmt(trackId, stem) : Promise.resolve(),
+        capabilities.chords ? loadCachedStemHarmony(trackId, stem) : Promise.resolve()
+      ];
+    }));
+  }
+  async function runLane(key: string, work: () => Promise<void>): Promise<void> {
+    laneBusy = { ...laneBusy, [key]: true }; laneErrors = { ...laneErrors, [key]: undefined };
+    try { await work(); } catch (error) { laneErrors = { ...laneErrors, [key]: String(error) }; }
+    finally { laneBusy = { ...laneBusy, [key]: false }; }
+  }
+  async function analyzeArrangement(kind: AnalyzeKind, stem?: string): Promise<void> {
+    if (!track) return;
+    const trackId = track.trackId;
+    const current = (): boolean => track?.trackId === trackId;
+    if (kind === 'rhythm') return runLane('rhythm', async () => { const report = await invoke<RhythmReport>('analyze_rhythm', { trackId }); if (current()) rhythm = report; });
+    if (kind === 'mix-chords') return runLane('mix-chords', async () => { const report = await invoke<HarmonyReport>('analyze_harmony', { trackId }); if (current()) harmony = report; });
+    if (!stem) return;
+    if (kind === 'notes') {
+      const capabilities = laneCapabilities(stem);
+      return runLane(`${stem}:notes`, async () => {
+        if (capabilities.notes === 'pitch') { const report = await invoke<PitchReport>('analyze_pitch', { trackId, stem }); if (current()) pitch = { ...pitch, [stem]: report }; }
+        else if (capabilities.notes === 'amt') { const report = await invoke<AmtReport>('transcribe_track', { trackId, stem }); if (current()) stemAmt = { ...stemAmt, [stem]: report }; }
+      });
+    }
+    return runLane(`${stem}:chords`, async () => { const report = await invoke<HarmonyReport>('analyze_harmony', { trackId, stem }); if (current()) stemHarmony = { ...stemHarmony, [stem]: report }; });
+  }
+  async function analyzeAllLanes(): Promise<void> {
+    if (!track || !audio?.stemMix || laneBatch) return;
+    const trackId = track.trackId;
+    const tasks: [AnalyzeKind, string | undefined][] = [];
+    if (!rhythm) tasks.push(['rhythm', undefined]);
+    if (!harmony) tasks.push(['mix-chords', undefined]);
+    for (const { stem } of audio.stems) {
+      const capabilities = laneCapabilities(stem);
+      const hasNotes = capabilities.notes === 'pitch' ? pitch[stem] !== undefined : stemAmt[stem] !== undefined;
+      if (capabilities.notes && !hasNotes) tasks.push(['notes', stem]);
+      if (capabilities.chords && stemHarmony[stem] === undefined) tasks.push(['chords', stem]);
+    }
+    if (tasks.length === 0) return;
+    laneBatch = { done: 0, total: tasks.length };
+    try {
+      for (const [kind, stem] of tasks) {
+        if (track?.trackId !== trackId) break;
+        await analyzeArrangement(kind, stem);
+        laneBatch = { done: (laneBatch?.done ?? 0) + 1, total: tasks.length };
+      }
+    } finally { laneBatch = undefined; }
   }
 
   async function loadCachedRhythm(id: string): Promise<void> { try { rhythm = await invoke<RhythmReport | null>('cached_rhythm', { trackId: id }) ?? undefined; } catch { rhythm = undefined; } }
@@ -301,7 +378,7 @@
     {:else if activeTab === 'analysis'}
       <section class="analysis-grid"><article class="panel"><p class="eyebrow">RHYTHM</p><h2>{rhythm ? `${rhythm.bpm.toFixed(1)} BPM` : 'Tempo & beats'}</h2><p>{rhythm ? `${Math.round(rhythm.stabilityScore * 100)}% beat stability · ${rhythm.beatTimes.length} beats` : 'Find tempo and a beat grid from the normalized source.'}</p><button class="primary" type="button" disabled={analyzingRhythm} onclick={analyzeRhythm}>{analyzingRhythm ? 'Analyzing…' : rhythm ? 'Reanalyze rhythm' : 'Analyze rhythm'}</button>{#if rhythm}<div class="beats" aria-label={`${rhythm.beatTimes.length} beats detected`}>{#each visibleBeats(rhythm.beatTimes) as beat}<i style={`left:${beat / Math.max(track.durationSeconds, 0.01) * 100}%`}></i>{/each}</div>{/if}{#if rhythmError}<p class="error">{rhythmError}</p>{/if}</article><article class="panel"><p class="eyebrow">HARMONY</p><h2>{harmony ? harmony.key.label : 'Key & chords'}</h2><p>{harmony ? `${harmony.chords.length} chord segments · ${harmony.algorithm}` : 'Estimate key and triad changes, aligned to the beat grid when available.'}</p><button class="primary" type="button" disabled={analyzingHarmony} onclick={analyzeHarmony}>{analyzingHarmony ? 'Analyzing…' : harmony ? 'Reanalyze harmony' : 'Analyze harmony'}</button>{#if harmony}<div class="chords">{#each visibleChords(harmony.chords) as chord}<span style={`left:${chord.start / Math.max(track.durationSeconds, 0.01) * 100}%;width:${(chord.end - chord.start) / Math.max(track.durationSeconds, 0.01) * 100}%`}>{chord.label}</span>{/each}</div>{/if}{#if harmonyError}<p class="error">{harmonyError}</p>{/if}</article><article class="panel pitch"><p class="eyebrow">STEM PITCH</p><h2>Bass & vocal notes</h2><p>Use separated bass or vocal stems for pYIN note segmentation.</p><div class="actions">{#each ['bass', 'vocals'] as stem}<button class="secondary" type="button" disabled={analyzingPitch !== undefined} onclick={() => analyzePitch(stem)}>{analyzingPitch === stem ? `Analyzing ${stem}…` : `Analyze ${stem}`}</button>{/each}</div>{#each Object.entries(pitch) as [stem, result]}{#if result}<span class="chip"><b>{stem}</b> {result.notes.length} notes · {result.engine}</span>{/if}{/each}{#if pitchError}<p class="error">{pitchError}</p>{/if}</article></section>
     {:else}
-      <section class="panel"><div class="heading"><div><p class="eyebrow">STEM MIXER</p><h2>{audio?.stemMix ? 'Balance your separated stems.' : 'Load generated stems to start mixing.'}</h2></div><em>{audio?.stemMix ? `${audio.stems.length} channels` : 'waiting for stems'}</em></div>{#if audio?.stemMix}<canvas bind:this={waveformCanvas} width="900" height="120"></canvas><div class="actions"><button class="primary" type="button" onclick={() => audioCommand('play_audio')}>▶ Play mix</button><button class="secondary" type="button" onclick={() => audioCommand('pause_audio')}>Pause</button><button class="secondary" type="button" onclick={() => audioCommand('stop_audio')}>Stop</button></div><div class="mixer-list">{#each audio.stems as stem}<div><section><strong>{stem.stem}</strong><small>{stemStatus(stem, audio.stems)}</small></section><button class:active={stem.muted} aria-pressed={stem.muted} type="button" onclick={() => audioCommand('set_stem_muted', { stem: stem.stem, muted: !stem.muted })}>Mute</button><button class:active={stem.solo} aria-pressed={stem.solo} type="button" onclick={() => audioCommand('set_stem_solo', { stem: stem.stem, solo: !stem.solo })}>Solo</button><input aria-label={`${stem.stem} volume`} type="range" min="0" max="2" step="0.01" value={stem.volume} oninput={(event) => scheduleVolume('set_stem_volume', { stem: stem.stem, volume: Number(event.currentTarget.value) })} /></div>{/each}</div>{:else}<div class="empty"><span>≋</span><h3>Your mix will appear here</h3><p>Generate a stem set in the Stems tab, then choose “Open mixer”.</p><button class="primary" type="button" onclick={() => selectTab('separation')}>Go to stems</button></div>{/if}{#if audioError}<p class="error">{audioError}</p>{/if}</section>
+      <section class="panel"><div class="heading"><div><p class="eyebrow">STEM MIXER</p><h2>{audio?.stemMix ? 'Follow every stem on the timeline.' : 'Load generated stems to start mixing.'}</h2></div><em>{audio?.stemMix ? `${audio.stems.length} lanes` : 'waiting for stems'}</em></div>{#if audio?.stemMix && track}<Arrangement durationSeconds={track.durationSeconds} {audio} waveforms={stemWaveforms} {rhythm} mixHarmony={harmony} {pitch} {stemAmt} {stemHarmony} busy={laneBusy} errors={laneErrors} batch={laneBatch} onCommand={audioCommand} onVolume={scheduleVolume} onAnalyze={analyzeArrangement} onAnalyzeAll={analyzeAllLanes} />{:else}<div class="empty"><span>≋</span><h3>Your mix will appear here</h3><p>Generate a stem set in the Stems tab, then choose “Open mixer”.</p><button class="primary" type="button" onclick={() => selectTab('separation')}>Go to stems</button></div>{/if}{#if audioError}<p class="error">{audioError}</p>{/if}</section>
     {/if}
   {/if}
 </main>
