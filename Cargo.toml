@@ -25,3 +25,8 @@ tokio = { version = "1.48", features = ["io-util", "macros", "process", "rt-mult
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
+
+# Dependencies (audio decoding in particular) are optimised even in dev builds: at opt-level 0
+# decoding a stem mix takes several seconds instead of a fraction of one.
+[profile.dev.package."*"]
+opt-level = 3
