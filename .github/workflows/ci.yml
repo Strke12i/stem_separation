@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Windows is the only platform this project builds, tests and packages for
+# today (see docs/PACKAGING.md "Estado atual"). Extending this matrix to
+# Linux/macOS depends on porting the .ps1 scripts and the FFmpeg discovery
+# in apps/desktop/src-tauri/src/ingest.rs first.
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Rust's own test suite spawns a plain `python` process to drive the
+      # fixture worker in tests/fixtures/fake_worker.py (stdlib only, no
+      # librosa/torch/etc.), so only an interpreter on PATH is needed here —
+      # not the heavier per-worker environments the python job below sets up.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  python-worker:
+    name: Python (${{ matrix.worker }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [analysis-worker, amt-worker]
+    defaults:
+      run:
+        working-directory: python/${{ matrix.worker }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # uv resolves and downloads the exact Python version each worker's
+      # pyproject.toml requires (analysis-worker: 3.11-3.14, amt-worker:
+      # 3.10 only, pinned by basic-pitch) — no separate setup-python needed.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "python/${{ matrix.worker }}/uv.lock"
+
+      - name: ruff format --check
+        run: uv run ruff format --check
+
+      - name: ruff check
+        run: uv run ruff check
+
+      - name: mypy
+        run: uv run mypy src tests
+
+      - name: pytest
+        run: uv run pytest
+
+  frontend:
+    name: Frontend (svelte-check, vitest, build)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - run: npm ci
+
+      - name: svelte-check
+        run: npx svelte-check --tsconfig ./tsconfig.json
+
+      - name: vitest
+        run: npx vitest run
+
+      - name: build
+        run: npm run build
