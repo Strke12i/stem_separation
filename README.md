@@ -1,6 +1,105 @@
-# Local Music Analyzer — Rust + Python
+# Local Music Analyzer
 
-Aplicativo desktop local e open-source para análise musical.
+[![CI](https://github.com/Strke12i/stem_separation/actions/workflows/ci.yml/badge.svg)](https://github.com/Strke12i/stem_separation/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Aplicativo desktop **local e open-source** para separar uma música em stems
+(vocal, bateria, baixo, outros) e analisá-la: BPM, tonalidade, acordes, notas
+por instrumento e MIDI — tudo rodando na sua máquina, sem enviar áudio a
+nenhum serviço externo.
+
+![Mixer com stems, waveform, notas e acordes por faixa](docs/assets/mixer-screenshot.png)
+
+## O que ele faz
+
+A partir de uma faixa local (MP3, WAV, FLAC, M4A, AAC, OGG, OPUS), o app produz:
+
+- **stems por instrumento** (Demucs, 4 ou 6 stems, rodando localmente);
+- **BPM e grade de batidas**;
+- **tonalidade e timeline de acordes**;
+- **notas por stem** (pYIN para baixo/vocal, Basic Pitch para os demais) com
+  exportação de MIDI;
+- um **mixer estilo DAW**, com uma faixa por stem, solo/mute/volume, waveform,
+  notas e acordes sincronizados com a reprodução;
+- artefatos JSON reprodutíveis, salvos localmente por música (o mesmo áudio
+  nunca é reprocessado duas vezes).
+
+## Plataformas suportadas
+
+**Hoje: só Windows 10/11 x86_64**, testado e com CI rodando nessa plataforma.
+A arquitetura foi desenhada para ser portável (o host Rust usa FFmpeg e
+Symphonia, não APIs específicas de uma plataforma), mas a descoberta de
+FFmpeg, os scripts de instalação de modelo e de empacotamento ainda são
+`.ps1` Windows-only. Linux e macOS estão no roadmap (`docs/ROADMAP.md`), não
+implementados — ver `docs/PACKAGING.md` para o que falta para portar.
+
+## Como rodar (desenvolvimento)
+
+Pré-requisitos:
+
+- [Rust stable](https://rustup.rs/) (edition 2024, `rust-version = "1.85"`);
+- [Node.js 22+](https://nodejs.org/);
+- [uv](https://docs.astral.sh/uv/) (gerencia os ambientes Python dos workers);
+- FFmpeg no `PATH` (ou instalado via winget — ver `docs/IMPLEMENTATION_STATUS.md`);
+- [Tauri CLI prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2
+  já vem com o Windows 10/11 atualizado).
+
+```powershell
+git clone https://github.com/Strke12i/stem_separation.git
+cd stem_separation/apps/desktop
+npm install
+npm run tauri dev
+```
+
+Isso compila o host Rust, sobe o Vite e abre a janela do app. Os workers
+Python (`python/analysis-worker`, `python/amt-worker`) são iniciados pelo
+host via `uv run` na primeira análise — não é preciso rodar `uv sync`
+manualmente, embora fazê-lo antecipe o download das dependências.
+
+Para separar uma música você também precisa instalar pelo menos um modelo
+Demucs localmente (download explícito, nunca automático):
+
+```powershell
+.\scripts\install-demucs.ps1 -Model demucs-4
+```
+
+Veja `docs/MODEL_MANAGEMENT.md` para o modelo de 6 stems (experimental, com
+guitarra e piano separados) e `docs/PACKAGING.md` para gerar um instalador.
+
+### Gates de qualidade
+
+```powershell
+cargo fmt --all --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+
+cd python/analysis-worker; uv run ruff format --check; uv run ruff check; uv run mypy src tests; uv run pytest
+cd python/amt-worker;      uv run ruff format --check; uv run ruff check; uv run mypy src tests; uv run pytest
+
+cd apps/desktop; npx svelte-check; npx vitest run; npm run build
+```
+
+O CI (`.github/workflows/ci.yml`) roda os três grupos acima em todo push e
+pull request para `main`.
+
+## Licença e avisos de terceiros
+
+Código sob [licença MIT](LICENSE). O app baixa modelos de terceiros (Demucs,
+Basic Pitch) sob ação explícita do usuário — eles não são distribuídos neste
+repositório. Ver [`NOTICE.md`](NOTICE.md) para a licença de cada modelo e das
+principais dependências.
+
+Esta ferramenta não confere nenhum direito sobre o áudio que você processa.
+Você é responsável por ter autorização para analisar/separar a música que
+importa; nada sai da sua máquina (ver `docs/SECURITY_PRIVACY.md`).
+
+---
+
+## Arquitetura
+
+As seções abaixo documentam as decisões de design para quem for contribuir ou
+quiser entender por dentro como o app é construído. `docs/` tem o detalhamento
+completo; `docs/DECISIONS.md` registra cada decisão com o motivo.
 
 A arquitetura combina:
 
@@ -9,22 +108,6 @@ A arquitetura combina:
 - **Tauri 2** como shell desktop;
 - **Svelte + TypeScript** como camada visual;
 - **sidecars Python isolados** para proteger o processo principal contra falhas de ML.
-
-## Objetivo
-
-Receber uma faixa local e produzir:
-
-- stems por instrumento;
-- BPM e grade de beats;
-- tonalidade;
-- timeline de acordes;
-- pitch/notas por stem;
-- MIDI opcional;
-- visualização sincronizada;
-- player/mixer com solo, mute e volume;
-- artefatos JSON reproduzíveis.
-
-Tudo deve funcionar localmente. O áudio não deve ser enviado a serviços externos.
 
 ## Princípio arquitetural
 
