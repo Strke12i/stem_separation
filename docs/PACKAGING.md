@@ -4,6 +4,15 @@
 
 Chegar a um instalador desktop sem exigir que o usuário configure manualmente Python.
 
+## Estado atual
+
+Implementado e testado: só Windows x86_64, via os scripts `.ps1` abaixo. As
+seções de Linux/macOS deste documento descrevem o desenho alvo (por isso a
+arquitetura evita API Windows-only no host Rust em si), não um pipeline que já
+existe. Portar exige: scripts de build equivalentes aos `.ps1`, a descoberta de
+FFmpeg (hoje restrita a `#[cfg(windows)]` em `ingest.rs`, com fallback via
+winget) e `externalBin` por target triple de cada plataforma.
+
 ## Fases
 
 ### Desenvolvimento

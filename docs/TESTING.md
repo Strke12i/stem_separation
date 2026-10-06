@@ -157,9 +157,14 @@ Testar lógica de:
 
 Não duplicar testes do domínio Rust no frontend.
 
-## CI futura
+## CI
 
-Matriz:
+Hoje: `.github/workflows/ci.yml` roda em `windows-latest`, em todo push e pull
+request para `main` — `cargo fmt`/`clippy`/`test` do workspace Rust,
+`ruff`/`mypy`/`pytest` dos dois workers Python e `svelte-check`/`vitest`/`build`
+do frontend. É a única plataforma coberta hoje (ver `PACKAGING.md`).
+
+Futura — matriz completa:
 
 ```text
 Windows x86_64
@@ -167,6 +172,8 @@ Linux x86_64
 macOS arm64
 ```
 
+Linux e macOS dependem de portar os scripts `.ps1` de instalação/empacotamento
+e a descoberta de FFmpeg (hoje `#[cfg(windows)]`) antes de entrarem na matriz.
 Workers científicos pesados podem ter pipeline separado.
 
 ## Definition of Done
